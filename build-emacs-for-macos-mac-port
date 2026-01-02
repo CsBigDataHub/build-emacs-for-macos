@@ -104,13 +104,20 @@ class MacPortBuild < Build
   # directory prior to `make install`. Some Makefile install steps expect the
   # directory to exist and the staging prefix to be writable.
   def compile_source(source)
-    target = File.join(source, "nextstep")
-    emacs_app = File.join(target, "Emacs.app")
+    # Accept either mac-port or NS-port style prebuilt app directories
+    ns_target = File.join(source, "nextstep")
+    mac_target = File.join(source, "mac")
+    ns_app = File.join(ns_target, "Emacs.app")
+    mac_app = File.join(mac_target, "Emacs.app")
 
-    if File.exist?(emacs_app)
-      info "Emacs.app already exists in " \
-           "\"#{target.gsub("#{root_dir}/", "")}\", attempting to use."
-      return emacs_app
+    if app_has_binary?(ns_app)
+      rel = ns_target.gsub("#{root_dir}/", "")
+      info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
+      return ns_app
+    elsif app_has_binary?(mac_app)
+      rel = mac_target.gsub("#{root_dir}/", "")
+      info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
+      return mac_app
     end
 
     info "Compiling from source. This will take a while..."
@@ -228,7 +235,7 @@ class MacPortBuild < Build
       # Add coreutils gnubin to PATH if present
       gnubin = "/opt/homebrew/opt/coreutils/libexec/gnubin"
       if Dir.exist?(gnubin)
-        ENV["PATH"] = "#{gnubin}:#{ENV['PATH']}"
+        ENV["PATH"] = "#{gnubin}:#{ENV["PATH"]}"
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
@@ -239,29 +246,46 @@ class MacPortBuild < Build
         warn "make install exited with non-zero status"
       end
 
+      # If make install placed Emacs.app directly into the output build dir
+      # (common for mac-port --enable-mac-app install targets), prefer that
+      # path as the produced app.
+      alt_app = File.join(output_dir, build_name, "Emacs.app")
+      if app_has_binary?(alt_app)
+        info "Detected Emacs.app with binary at install target: #{alt_app}, using that as build output"
+        return alt_app
+      end
+
       # If install failed, print tail of install log for debugging
-      unless File.exist?(emacs_app)
+      unless app_has_binary?(ns_app) || app_has_binary?(mac_app) || app_has_binary?(alt_app)
         if File.exist?(install_log)
           warn "--- #{install_log} (last 200 lines) ---"
           IO.readlines(install_log).last(200).each { |l| warn l.chomp }
         end
       end
-
-      # If make install placed Emacs.app directly into the output build dir
-      # (some Makefile install stanzas do this), prefer that path as the
-      # produced app. Set emacs_app to the installed location so the rest of
-      # the build flow uses the actual produced bundle instead of attempting
-      # to move it.
-      alt_app = File.join(output_dir, build_name, "Emacs.app")
-      if !File.exist?(emacs_app) && File.exist?(alt_app)
-        info "Detected Emacs.app at install target: #{alt_app}, using that as build output"
-        emacs_app = alt_app
-      end
     end
 
-    fatal "Build failed." unless File.exist?(emacs_app)
+    # After building, prefer a produced app under source (ns or mac). If none
+    # exists, fail.
+    if app_has_binary?(ns_app)
+      ns_app
+    elsif app_has_binary?(mac_app)
+      mac_app
+    else
+      fatal "Build failed. Emacs.app with binary not found after build."
+    end
+  end
 
-    emacs_app
+  # Helper to check if an Emacs.app actually contains the compiled binary
+  # (not just a skeleton directory from source extraction)
+  def app_has_binary?(app_path)
+    return false unless File.exist?(app_path)
+    # Check for the main Emacs binary in standard locations
+    binary_paths = [
+      File.join(app_path, "Contents", "MacOS", "Emacs"),
+      File.join(app_path, "Contents", "MacOS", "Emacs-arm64-11"),
+      File.join(app_path, "Contents", "MacOS", "Emacs-x86_64-10_14"),
+    ]
+    binary_paths.any? { |p| File.exist?(p) && File.file?(p) && !File.symlink?(p) }
   end
 
   # Override create_build_dir to handle cases where `make install` has already
@@ -309,30 +333,48 @@ class MacPortBuild < Build
   # cause Apple's codesign to reject the bundle. Replace dots with underscores
   # in offending directory names and apply native-lisp pdmp patching when we
   # detect native-lisp layout patterns.
+  #
+  # IMPORTANT: We only sanitize DIRECTORIES, not files. Library files (.dylib,
+  # .so, .eln) have their install names managed by LibEmbedder and must keep
+  # their original names to match the @rpath references in binaries.
+  #
+  # For directories under libexec/ that match the darwin arch pattern
+  # (e.g., aarch64-apple-darwin25.1.0), we rename them AND create a symlink
+  # from the original name to the new name, because Emacs has these paths
+  # compiled into the binary.
   def sanitize_bundle_dirs(app)
     return unless File.exist?(app) && File.directory?(app)
 
     # Walk entire bundle (excluding the top-level .app itself) and rename any
-    # path component whose basename contains two or more dots. We process the
+    # DIRECTORY whose basename contains two or more dots. We process the
     # longest paths first so child entries are moved before parents.
     entries = Dir[File.join(app, "**", "*")]
     entries.sort_by! { |e| -e.length }
 
     entries.each do |path|
       next if path == app
-      # Only consider path components inside the bundle (skip symlink targets)
+      # Only consider DIRECTORIES, not files. Files (especially .dylib) must
+      # keep their original names to match install_name references.
+      next unless File.directory?(path)
+
       base = File.basename(path)
       next unless base.match(/\..+\./)
 
       parent = File.dirname(path)
-      new_base = base.gsub('.', '_')
+      new_base = base.gsub(".", "_")
       old_name = path
       new_name = File.join(parent, new_base)
 
       # Avoid touching the Emacs.app bundle directory itself
       next if old_name.end_with?(".app") && old_name == app
 
-      info "Sanitizing bundle path: #{old_name} --> #{new_name}"
+      # Check if this is a darwin architecture directory under libexec/
+      # These paths are compiled into the Emacs binary, so we need to create
+      # a symlink from the original name to the renamed directory.
+      is_libexec_arch_dir = path.include?("/libexec/") &&
+                            base.match(/^(aarch64|x86_64|arm64)-apple-darwin\d+\.\d+\.\d+$/)
+
+      info "Sanitizing bundle directory: #{old_name} --> #{new_name}"
 
       begin
         # Ensure parent is writable so mv succeeds
@@ -350,10 +392,20 @@ class MacPortBuild < Build
         end
 
         FileUtils.mv(old_name, new_name)
+
+        # For libexec arch directories, create a symlink from old name to new name
+        # so Emacs can find its pdmp file and helper executables
+        if is_libexec_arch_dir
+          info "Creating symlink for libexec arch directory: #{base} -> #{File.basename(new_name)}"
+          FileUtils.ln_s(File.basename(new_name), old_name)
+        end
       rescue Errno::EACCES, Errno::EPERM => e
         warn "Permission error renaming #{old_name}, attempting sudo: #{e.message}"
         begin
           run_cmd("sudo", "mv", old_name, new_name)
+          if is_libexec_arch_dir
+            run_cmd("sudo", "ln", "-s", File.basename(new_name), old_name)
+          end
         rescue Error => ee
           fatal "Failed to rename #{old_name} to #{new_name}: #{ee.message}"
         end
