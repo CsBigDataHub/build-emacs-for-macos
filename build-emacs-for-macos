@@ -47,12 +47,12 @@ module Output
         Logger
           .new($stderr)
           .tap do |logger|
-          logger.level = Logger::INFO
-          logger.formatter =
-            proc do |severity, _datetime, _progname, msg|
-              "==> #{severity.upcase}: #{msg}"
-            end
+        logger.level = Logger::INFO
+        logger.formatter =
+          proc do |severity, _datetime, _progname, msg|
+          "==> #{severity.upcase}: #{msg}"
         end
+      end
     end
   end
 
@@ -150,9 +150,11 @@ class AbstractVersion
   attr_reader :version
 
   def initialize
-    @version = load_version.match(
+    str = load_version.strip
+    @version = str.match(
       /(?<major>\d+)(?:\.(?<minor>\d+)(?:\.(?<patch>\d+))?)?/
     )
+    warn "Parsed OS version string: '#{str}' => #{@version ? @version[0] : "NIL"}"
   end
 
   def load_version
@@ -164,15 +166,15 @@ class AbstractVersion
   end
 
   def major
-    @major ||= @version[:major]&.to_i
+    @major ||= (@version && @version[:major]) ? @version[:major].to_i : 0
   end
 
   def minor
-    @minor ||= @version[:minor]&.to_i
+    @minor ||= (@version && @version[:minor]) ? @version[:minor].to_i : 0
   end
 
   def patch
-    @patch ||= @version[:patch]&.to_i
+    @patch ||= (@version && @version[:patch]) ? @version[:patch].to_i : 0
   end
 end
 
@@ -483,8 +485,8 @@ class Build
       idx = lines.index { |l| l.match(/^\s*WEBKIT_CFLAGS=.*WebKit.framework\/Headers.*$/) }
       if idx
         lines[idx] = "SDKROOT=$(xcrun --show-sdk-path)\n" \
-        "WEBKIT_CFLAGS=\"-I${SDKROOT}/System/Library/Frameworks/WebKit.framework/Headers\"\n" \
-        "# WEBKIT_CFLAGS=\"-I/System/Library/Frameworks/WebKit.framework/Headers\"\n"
+                     "WEBKIT_CFLAGS=\"-I${SDKROOT}/System/Library/Frameworks/WebKit.framework/Headers\"\n" \
+                     "# WEBKIT_CFLAGS=\"-I/System/Library/Frameworks/WebKit.framework/Headers\"\n"
         File.write(cfg, lines.join)
         info "Patched configure.ac to use SDKROOT for WEBKIT_CFLAGS"
       end
@@ -837,7 +839,7 @@ class Build
         Dir[
           "MacOS/libexec/emacs/**/eln-cache",
           "MacOS/lib/emacs/**/native-lisp"
-        ].first
+          ].first
 
       # Skip creation of symlinks if *.eln files are not located in a location
       # known to be used by builds which need symlinks and other tweaks.
@@ -888,7 +890,7 @@ class Build
           Dir[
             "MacOS/libexec/emacs/**/eln-cache",
             "MacOS/lib/emacs/**/native-lisp"
-          ].first
+            ].first
 
         if source.nil?
           fatal "Failed to find native-lisp cache directory for " \
@@ -1141,19 +1143,19 @@ class Build
 
   def effective_version
     @effective_version ||= case ref
-      when /^emacs-26.*/
-        26
-      when /^emacs-27.*/
-        27
-      when /^emacs-28.*/
-        28
-      when /^emacs-29.*/
-        29
-      when /^emacs-30.*/
-        30
-      else
-        31
-      end
+                           when /^emacs-26.*/
+                             26
+                           when /^emacs-27.*/
+                             27
+                           when /^emacs-28.*/
+                             28
+                           when /^emacs-29.*/
+                             29
+                           when /^emacs-30.*/
+                             30
+                           else
+                             31
+                           end
   end
 
   def build_patches
@@ -1549,14 +1551,14 @@ class IconEmbedder < AbstractEmbedder
 
   def resolve_source(uri, expected_ext, download_name)
     file_path = if valid_url?(uri)
-        download_file(uri, download_name)
-      else
-        local = File.expand_path(uri)
-        unless File.exist?(local)
-          fatal "File does not exist: #{local}"
-        end
-        local
-      end
+                  download_file(uri, download_name)
+                else
+                  local = File.expand_path(uri)
+                  unless File.exist?(local)
+                    fatal "File does not exist: #{local}"
+                  end
+                  local
+                end
 
     ext = File.extname(file_path).downcase
 
@@ -1694,7 +1696,7 @@ class LibEmbedder < AbstractEmbedder
 
     if abs.include?("@rpath")
       abs = rpaths.map { |r| abs.gsub("@rpath", r) }
-        .find { |f| File.exist?(f) }
+              .find { |f| File.exist?(f) }
 
       fatal "Could not resolve path: #{path}" if abs.nil?
     end
@@ -1949,29 +1951,29 @@ class GccInfo
 
   def root_dir
     @root_dir ||= if use_nix?
-        libgccjit_root_dir
-      else
-        `brew --prefix gcc`.chomp
-      end
+                    libgccjit_root_dir
+                  else
+                    `brew --prefix gcc`.chomp
+                  end
   end
 
   def major_version
     @major_version ||= if use_nix?
-        libgccjit_major_version
-      else
-        File.basename(lib_dir)
-      end
+                         libgccjit_major_version
+                       else
+                         File.basename(lib_dir)
+                       end
   end
 
   def lib_dir
     @lib_dir ||= if use_nix?
-        File.join(root_dir, "lib")
-      else
-        Dir[File.join(root_dir, "lib/gcc/*/libgcc*")]
-          .map { |path| File.dirname(path) }
-          .select { |path| File.basename(path).match(/^\d+$/) }
-          .max_by { |path| File.basename(path).to_i }
-      end
+                   File.join(root_dir, "lib")
+                 else
+                   Dir[File.join(root_dir, "lib/gcc/*/libgcc*")]
+                     .map { |path| File.dirname(path) }
+                     .select { |path| File.basename(path).match(/^\d+$/) }
+                     .max_by { |path| File.basename(path).to_i }
+                 end
   end
 
   def target_lib_dir
@@ -2030,35 +2032,35 @@ class GccInfo
 
   def libgccjit_root_dir
     @libgccjit_root_dir ||= if use_nix?
-        ENV["NIX_LIBGCCJIT_ROOT"]&.strip
-      else
-        `brew --prefix libgccjit`.chomp
-      end
+                              ENV["NIX_LIBGCCJIT_ROOT"]&.strip
+                            else
+                              `brew --prefix libgccjit`.chomp
+                            end
   end
 
   def libgccjit_major_version
     @libgccjit_major_version ||= if use_nix?
-        # rubocop:disable Style/SafeNavigationChainLength
-        ENV["NIX_LIBGCCJIT_VERSION"]&.strip&.split(".")&.first
-        # rubocop:enable Style/SafeNavigationChainLength
-      else
-        File.basename(libgccjit_lib_dir.to_s)
-      end
+      # rubocop:disable Style/SafeNavigationChainLength
+                                   ENV["NIX_LIBGCCJIT_VERSION"]&.strip&.split(".")&.first
+                                   # rubocop:enable Style/SafeNavigationChainLength
+                                 else
+                                   File.basename(libgccjit_lib_dir.to_s)
+                                 end
   end
 
   def libgccjit_lib_dir
     @libgccjit_lib_dir ||= if use_nix?
-        Dir[File.join(libgccjit_root_dir, "lib/libgccjit*.dylib")]
-          .map { |path| File.dirname(path) }.first
-      else
-        Dir[
-          File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit*.dylib"),
-          File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit.so*"),
-        ]
-          .map { |path| File.dirname(path) }
-          .select { |path| File.basename(path).match(/^\d+$/) }
-          .max_by { |path| File.basename(path).to_i }
-      end
+                             Dir[File.join(libgccjit_root_dir, "lib/libgccjit*.dylib")]
+                               .map { |path| File.dirname(path) }.first
+                           else
+                             Dir[
+                               File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit*.dylib"),
+                               File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit.so*"),
+                               ]
+                               .map { |path| File.dirname(path) }
+                               .select { |path| File.basename(path).match(/^\d+$/) }
+                               .max_by { |path| File.basename(path).to_i }
+                           end
   end
 
   def verify_libgccjit
