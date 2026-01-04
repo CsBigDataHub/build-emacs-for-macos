@@ -17,6 +17,31 @@ Use this script at your own risk.
   built from the `master` branch. This script allows you to choose any branch,
   tag, or git ref you want.
 
+## Mac Port Support
+
+In addition to building the standard NS-port (NeXTstep) Emacs, this repository
+now includes `build-emacs-for-macos-mac-port` which builds the
+[Mac port](https://github.com/jdtsmith/emacs-mac) (also known as emacs-mac) by
+jdtsmith. The Mac port provides a more native macOS experience with:
+
+- Better integration with macOS system features
+- Metal rendering backend for improved performance
+- Enhanced macOS-specific functionality
+- More native look and feel
+
+To build the Mac port instead of the standard NS-port:
+
+```bash
+./build-emacs-for-macos-mac-port emacs-30
+```
+
+The Mac port build script accepts all the same options as the standard build
+script, but defaults to the `jdtsmith/emacs-mac` repository and applies
+Mac port-specific configuration instead of NS-port patches.
+
+**Note:** Mac port builds are distinguished with "MacPort" in their build name
+to avoid confusion with NS-port builds.
+
 ## Binary Builds
 
 Nightly and stable binary builds produced with this build script are available
@@ -83,6 +108,10 @@ I have successfully built:
 - `emacs-30.0.92` pretest tag.
 - `master` branch (Emacs 31.x).
 
+**Mac Port Status:** The Mac port build script has been tested with recent
+commits from the `jdtsmith/emacs-mac` repository and successfully produces
+working builds on both Intel and Apple Silicon machines.
+
 For reference, my machine is:
 
 - 14-inch MacBook Pro (2023), Apple M3 Max (16-cores)
@@ -141,7 +170,7 @@ Options:
         --[no-]relink-eln-files      Enable/disable re-linking shared libraries in bundled *.eln files (default: enabled)
         --[no-]rsvg                  Enable/disable SVG image support via librsvg (default: enabled)
         --[no-]dbus                  Enable/disable dbus support (default: enabled)
-        --[no-]alpha-background      Enable/disable experimental alpha-background patch when building Emacs 30.x - 31.x (default: disabled)
+        --alpha-background           Apply experimental alpha-background patch when building Emacs 30.x - 31.x (default: disabled)
         --no-frame-refocus           Apply no-frame-refocus patch when building Emacs 27.x - 31.x (default: disabled)
         --no-titlebar                Apply no-titlebar patch when building Emacs 27.x - 28.x (default: disabled)
         --[no-]xwidgets              Enable/disable XWidgets when building Emacs 27.x (default: disabled)
@@ -151,10 +180,14 @@ Options:
         --[no-]fd-setsize SIZE       Set an file descriptor (max open files) limit (default: 10000)
         --github-src-repo REPO       Specify a GitHub repo to download source tarballs from (default: emacs-mirror/emacs)
         --[no-]github-auth           Make authenticated GitHub API requests if GITHUB_TOKEN environment variable is set.(default: enabled)
+        --[no-]use-gh-cli            Use gh cli to download source tarball instead of curl (default: disabled, fallback to curl if gh not available)
         --work-dir DIR               Specify a working directory where tarballs, sources, and builds will be stored and worked with
     -o, --output DIR                 Output directory for finished builds (default: <work-dir>/builds)
         --build-name NAME            Override generated build name
         --dist-include x,y,z         List of extra files to copy from Emacs source into build folder/archive (default: COPYING)
+        --icon-uri URI               Local path or URL to a .icns file to replace the default app icon
+        --tahoe-icon-uri URI         Local path or URL to an Assets.car file for macOS 26 icons. Requires --tahoe-icon-name.
+        --tahoe-icon-name NAME       Name of the icon in Assets.car to set as CFBundleIconName
         --[no-]self-sign             Enable/disable self-signing of Emacs.app (default: enabled)
         --[no-]archive               Enable/disable creating *.tbz archive (default: enabled)
         --[no-]archive-keep-build-dir
@@ -175,23 +208,80 @@ trash the corresponding directory from the `sources` directory.
 
 ### Examples
 
-To download a tarball of the `master` branch (Emacs 28.x with native-compilation
+#### NS-Port (Standard Emacs)
+
+To download a tarball of the `master` branch (Emacs 31.x with native-compilation
 as of writing) and build Emacs.app from it:
 
-```
+```bash
 ./build-emacs-for-macos
 ```
 
 To build the stable `emacs-29.4` release git tag run:
 
-```
+```bash
 ./build-emacs-for-macos emacs-29.4
 ```
 
-All sources as downloaded as tarballs from the
-[emacs-mirror](https://github.com/emacs-mirror/emacs) GitHub repository. Hence
-to get a list of tags/branches available to install, simply check said
-repository.
+To build with native-compilation and optimizations:
+
+```bash
+./build-emacs-for-macos emacs-30 --native-comp --optimize
+```
+
+#### Mac Port
+
+To build the Mac port from the latest code:
+
+```bash
+./build-emacs-for-macos-mac-port emacs-30
+```
+
+To build Mac port with native-compilation and optimizations:
+
+```bash
+./build-emacs-for-macos-mac-port emacs-30 --native-comp --optimize
+```
+
+To apply a custom patch to Mac port:
+
+```bash
+./build-emacs-for-macos-mac-port emacs-30 --patch=/path/to/custom.patch
+```
+
+#### Source Repositories
+
+All NS-port sources are downloaded as tarballs from the
+[emacs-mirror](https://github.com/emacs-mirror/emacs) GitHub repository. Mac
+port sources come from [jdtsmith/emacs-mac](https://github.com/jdtsmith/emacs-mac).
+
+To get a list of tags/branches available to install, simply check the respective
+repository. You can also use `--github-src-repo` to specify a different source
+repository:
+
+```bash
+./build-emacs-for-macos --github-src-repo=your-fork/emacs emacs-30
+```
+
+### Custom Icons
+
+You can replace the default Emacs icon with a custom icon:
+
+```bash
+# Using a local .icns file
+./build-emacs-for-macos emacs-30 --icon-uri=/path/to/custom-icon.icns
+
+# Using a URL to download icon
+./build-emacs-for-macos emacs-30 --icon-uri=https://example.com/icon.icns
+
+# Using an image file (will be converted to .icns)
+./build-emacs-for-macos emacs-30 --icon-uri=/path/to/icon.png
+
+# For macOS 11+ with Tahoe icon format (Assets.car)
+./build-emacs-for-macos emacs-30 \
+  --tahoe-icon-uri=/path/to/Assets.car \
+  --tahoe-icon-name="AppIcon"
+```
 
 ## Use Emacs.app as `emacs` CLI Tool
 
@@ -233,6 +323,9 @@ option, which will native-compile all of Emacs' elisp at built-time. On my
 machine it takes around 10 minutes to build Emacs.app with `NATIVE_FULL_AOT`
 disabled, and around 20-25 minutes with it enabled.
 
+**Mac Port Note:** Native-compilation is fully supported in Mac port builds and
+works the same way as in NS-port builds.
+
 ### Configuration
 
 #### Native-Lisp Cache Directory
@@ -265,7 +358,7 @@ packages, it can get annoying. You can disable showing these warnings by setting
 ### Issues
 
 Please see all issues with the
-[`native-comp`](https://github.com/jimeh/build-emacs-for-macos/issues?q=is%3Aissue+is%3Aopen+label%3Anative-comp)
+[native-comp](https://github.com/jimeh/build-emacs-for-macos/issues?q=is%3Aissue+is%3Aopen+label%3Anative-comp)
 label. It's a good idea if you read through them so you're familiar with the
 types of issues and or behavior you can expect.
 
@@ -274,15 +367,45 @@ types of issues and or behavior you can expect.
 A list of known "good" commits which produce working builds is tracked in:
 [#6 Known good commits for native-comp](https://github.com/jimeh/build-emacs-for-macos/issues/6)
 
+## Differences Between NS-Port and Mac Port
+
+### NS-Port (build-emacs-for-macos)
+- Official Emacs with NeXTstep/Cocoa port
+- Standard macOS integration
+- Applies community patches from emacs-plus
+- Source: [emacs-mirror/emacs](https://github.com/emacs-mirror/emacs)
+
+### Mac Port (build-emacs-for-macos-mac-port)
+- Enhanced macOS-specific port by jdtsmith
+- Better native macOS integration
+- Metal rendering backend for improved performance
+- More native look and feel
+- Does NOT apply NS-port specific patches
+- Source: [jdtsmith/emacs-mac](https://github.com/jdtsmith/emacs-mac)
+- Build names include "MacPort" for easy identification
+
+Both builds support:
+- Native-compilation (libgccjit)
+- Tree-sitter
+- Self-contained application bundles
+- Custom icons
+- All optimization flags
+
+Choose NS-port for the most standard Emacs experience with community patches, or
+Mac port for a more native macOS experience with better system integration.
+
 ## Credits
 
 - I've borrowed some ideas from [David Caldwell](https://github.com/caldwell)'s
   excellent [build-emacs](https://github.com/caldwell/build-emacs) project,
   which produces all builds for
   [emacsformacosx.com](https://emacsformacosx.com).
-- Patches applied are pulled from
+- Patches applied to NS-port builds are pulled from
   [emacs-plus](https://github.com/d12frosted/homebrew-emacs-plus), which is an
   excellent Homebrew formula with lots of options not available elsewhere.
+- Mac port support is based on the excellent work by
+  [jdtsmith](https://github.com/jdtsmith) on
+  [emacs-mac](https://github.com/jdtsmith/emacs-mac).
 - The following sources were extremely useful in figuring out how get get the
   `feature/native-comp` branch building on macOS:
   - https://gist.github.com/mikroskeem/0a5c909c1880408adf732ceba6d3f9ab#1-gcc-with-libgccjit-enabled
@@ -292,13 +415,18 @@ A list of known "good" commits which produce working builds is tracked in:
 ## Internals
 
 The script downloads the source code as a gzipped tar archive from the
-[GitHub mirror](https://github.com/emacs-mirror/emacs) repository, as it makes
-it very easy to get a tarball of any given git reference.
+[GitHub mirror](https://github.com/emacs-mirror/emacs) repository (or
+[emacs-mac](https://github.com/jdtsmith/emacs-mac) for Mac port builds), as it
+makes it very easy to get a tarball of any given git reference.
 
-It then runs `./configure` with a various options, including copying various
+It then runs `./configure` with various options, including copying various
 dynamic libraries into the application itself. So the built application should
 in theory run on a macOS install that does not have Homebrew, or does not have
 the relevant Homebrew formulas installed.
+
+The Mac port build script (`build-emacs-for-macos-mac-port`) is a lightweight
+wrapper that subclasses the main NS-port build script, overriding only the
+Mac port-specific differences while reusing most of the build infrastructure.
 
 Code quality of the script itself, is well, non-existent. The build script
 started life a super-quick hack back in 2013, and now it's even more of a dirty
