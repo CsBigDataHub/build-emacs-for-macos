@@ -47,12 +47,12 @@ module Output
         Logger
           .new($stderr)
           .tap do |logger|
-        logger.level = Logger::INFO
-        logger.formatter =
-          proc do |severity, _datetime, _progname, msg|
-          "==> #{severity.upcase}: #{msg}"
+          logger.level = Logger::INFO
+          logger.formatter =
+            proc do |severity, _datetime, _progname, msg|
+              "==> #{severity.upcase}: #{msg}"
+            end
         end
-      end
     end
   end
 
@@ -458,7 +458,6 @@ class Build
 
   def extract_tarball(filename, patches = [])
     FileUtils.mkdir_p(sources_dir)
-
     dirname = File.basename(filename).gsub(/\.\w+$/, "")
     target = File.join(sources_dir, dirname)
 
@@ -471,6 +470,11 @@ class Build
     result = run_cmd("tar", "-xzf", filename, "-C", sources_dir)
     fatal "Tarball extraction failed." unless result
 
+    # Verify extracted directory exists
+    unless Dir.exist?(target)
+      fatal "Extraction succeeded but target directory not found: #{target}"
+    end
+
     patches.each { |patch| apply_patch(patch, target) }
     apply_macos_startup_patch(target)
 
@@ -478,9 +482,6 @@ class Build
     cfg = File.join(target, "configure.ac")
     if File.exist?(cfg)
       content = File.read(cfg)
-      # Replace exactly one existing WEBKIT_CFLAGS line with a three-line
-      # block that uses the SDK path. Only the first matching line will be
-      # replaced to avoid touching other lines.
       lines = content.lines
       idx = lines.index { |l| l.match(/^\s*WEBKIT_CFLAGS=.*WebKit.framework\/Headers.*$/) }
       if idx
@@ -492,9 +493,11 @@ class Build
       end
     end
 
-    # Keep a copy of src after patches have been applied. This will be used to
-    # embed C sources into the output Emacs.app bundle.
-    cmd("cp", "-a", File.join(target, "src"), File.join(target, "src.orig"))
+    # Keep a copy of src after patches have been applied
+    src_orig = File.join(target, "src.orig")
+    unless File.exist?(src_orig)
+      cmd("cp", "-a", File.join(target, "src"), src_orig)
+    end
 
     target
   end
@@ -503,26 +506,34 @@ class Build
     return @configure_help if @configure_help
 
     FileUtils.cd(source_dir) { @configure_help = `./configure --help` }
-
     @configure_help
   end
 
+  def configure_features
+    @configure_features ||= begin
+        help = configure_help
+        {
+          xwidgets: !!help.match(/\s+--with-xwidgets\s+/),
+          tree_sitter: !!help.match(/\s+--with-tree-sitter(\s|=).+/),
+          native_comp_match: help.match(/\s+?(--with-native(?:comp|-compilation))(.+)?\s+?/),
+        }
+      end
+  end
+
   def supports_xwidgets?
-    @supports_xwidgets ||= !!configure_help.match(/\s+--with-xwidgets\s+/)
+    configure_features[:xwidgets]
   end
 
   def supports_tree_sitter?
-    @supports_tree_sitter ||=
-      !!configure_help.match(/\s+--with-tree-sitter(\s|=).+/)
+    configure_features[:tree_sitter]
   end
 
   def supports_native_comp?
-    @supports_native_comp ||= !native_comp_configure_flag.nil?
+    !native_comp_configure_flag.nil?
   end
 
   def native_comp_configure_match
-    @native_comp_configure_match ||=
-      configure_help.match(/\s+?(--with-native(?:comp|-compilation))(.+)?\s+?/)
+    configure_features[:native_comp_match]
   end
 
   def native_comp_configure_flag
@@ -726,7 +737,9 @@ class Build
       return emacs_app
     end
 
-    info "Compiling from source. This will take a while..."
+    parallelism = options[:parallel] || Etc.nprocessors
+    info "Compiling from source using #{parallelism} parallel processes."
+    info "This will take a while (10-25 minutes depending on options)..."
 
     FileUtils.cd(source) do
       if options[:native_comp]
@@ -750,23 +763,20 @@ class Build
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
       ]
-      if options[:xwidgets] && supports_xwidgets?
-        configure_flags << "--with-xwidgets"
-      end
-      if options[:tree_sitter] && supports_tree_sitter?
-        configure_flags << "--with-tree-sitter"
-      end
+
+      configure_flags << "--with-xwidgets" if options[:xwidgets] && supports_xwidgets?
+      configure_flags << "--with-tree-sitter" if options[:tree_sitter] && supports_tree_sitter?
       configure_flags << native_comp_configure_flag if options[:native_comp]
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
+      info "Running configure..."
       run_cmd(
         "./configure",         *configure_flags.compact,
         output_file: "configure_output.txt",
       )
 
-      # Disable aligned_alloc on Mojave and below. See issue:
-      # https://github.com/daviderestivo/homebrew-emacs-head/issues/15
+      # Disable aligned_alloc on Mojave and below
       if OS.sdk_version.major <= 10 && OS.sdk_version.minor <= 14
         info "Force disabling of aligned_alloc on macOS Mojave (10.14.x) " \
              "and earlier"
@@ -774,31 +784,32 @@ class Build
       end
 
       make_flags = []
-      make_flags += ["-j", options[:parallel].to_s] if options[:parallel]
+      make_flags += ["-j", parallelism.to_s]
 
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
 
         if options[:native_full_aot]
-          info "Using native compile full AOT"
-          # We do not need to supply the full AOT make arg if
-          # --with-native-compilation=aot configure flag is supported.
-          unless native_comp_configure_flag_arg
-            make_flags << "NATIVE_FULL_AOT=1"
-          end
+          info "Using native compile full AOT (this will take 20-25 minutes)"
+          make_flags << "NATIVE_FULL_AOT=1" unless native_comp_configure_flag_arg
           ENV.delete("NATIVE_FAST_BOOT")
         else
+          info "Using native compile fast boot (10-15 minutes)"
           ENV.delete("NATIVE_FULL_AOT")
           ENV["NATIVE_FAST_BOOT"] = "1"
         end
       end
 
+      info "Running make..."
       run_cmd "make", *make_flags.compact
+
+      info "Running make install..."
       run_cmd "make", "install"
     end
 
     fatal "Build failed." unless File.exist?(emacs_app)
 
+    info "Compilation completed successfully!"
     emacs_app
   end
 
@@ -839,7 +850,7 @@ class Build
         Dir[
           "MacOS/libexec/emacs/**/eln-cache",
           "MacOS/lib/emacs/**/native-lisp"
-          ].first
+        ].first
 
       # Skip creation of symlinks if *.eln files are not located in a location
       # known to be used by builds which need symlinks and other tweaks.
@@ -890,7 +901,7 @@ class Build
           Dir[
             "MacOS/libexec/emacs/**/eln-cache",
             "MacOS/lib/emacs/**/native-lisp"
-            ].first
+          ].first
 
         if source.nil?
           fatal "Failed to find native-lisp cache directory for " \
@@ -1086,6 +1097,22 @@ class Build
     return @meta if @meta
 
     ref_sha = options[:git_sha] || ref
+
+    # Cache the API response to disk to avoid repeated requests
+    cache_file = File.join(tarballs_dir, ".meta_cache_#{ref_sha.gsub("/", "_")}.json")
+    if File.exist?(cache_file) && (Time.now - File.mtime(cache_file)) < 3600
+      begin
+        cached = JSON.parse(File.read(cache_file), symbolize_names: true)
+        cached[:date] = Time.parse(cached[:date]) if cached[:date].is_a?(String)
+        info "Using cached commit info for: #{ref_sha}"
+        @meta = cached
+        return @meta
+      rescue JSON::ParserError, StandardError => e
+        warn "Failed to load cache: #{e.message}, fetching fresh data"
+        FileUtils.rm_f(cache_file)
+      end
+    end
+
     info "Fetching info for git ref: #{ref_sha}"
 
     # Try gh cli first if use_gh_cli is enabled and gh is available
@@ -1103,6 +1130,14 @@ class Build
       date: Time.parse(commit["commit"]["committer"]["date"]),
     }
     meta[:ref] = ref if ref && ref[0..6] != meta[:sha][0..6]
+
+    # Cache the result
+    begin
+      FileUtils.mkdir_p(tarballs_dir)
+      File.write(cache_file, meta.to_json)
+    rescue StandardError => e
+      warn "Failed to cache commit info: #{e.message}"
+    end
 
     @meta = meta
   end
@@ -1143,19 +1178,19 @@ class Build
 
   def effective_version
     @effective_version ||= case ref
-                           when /^emacs-26.*/
-                             26
-                           when /^emacs-27.*/
-                             27
-                           when /^emacs-28.*/
-                             28
-                           when /^emacs-29.*/
-                             29
-                           when /^emacs-30.*/
-                             30
-                           else
-                             31
-                           end
+      when /^emacs-26.*/
+        26
+      when /^emacs-27.*/
+        27
+      when /^emacs-28.*/
+        28
+      when /^emacs-29.*/
+        29
+      when /^emacs-30.*/
+        30
+      else
+        31
+      end
   end
 
   def build_patches
@@ -1457,13 +1492,11 @@ class CSourcesEmbedder < AbstractEmbedder
 
   def initialize(app, source_dir)
     super(app)
-
     @source_dir = source_dir
   end
 
   def embed
     info "Bundling C source files into Emacs.app for documentation purposes..."
-
     orig_src_dir = File.join(source_dir, "src.orig")
     src_dir = File.join(source_dir, "src")
     target_dir = File.join(resources_dir, "src")
@@ -1471,7 +1504,7 @@ class CSourcesEmbedder < AbstractEmbedder
     debug "Copying Emacs C sources to #{relative_app_path(target_dir)}"
 
     if File.exist?(orig_src_dir)
-      copy_sources(orig_src_dir, target_dir)
+      copy_sources_fast(orig_src_dir, target_dir)
     else
       copy_sources(
         src_dir, target_dir, File.join("**", "*.{awk,c,cc,h,in,m,mk}")
@@ -1480,6 +1513,19 @@ class CSourcesEmbedder < AbstractEmbedder
   end
 
   private
+
+  # Fast copy using rsync for entire directories
+  def copy_sources_fast(src_dir, target_dir)
+    FileUtils.mkdir_p(target_dir)
+    run_cmd(
+      "rsync", "-a",
+      "--exclude=ChangeLog*",
+      "--exclude=*.o",
+      "--exclude=*.elc",
+      File.join(src_dir, "/"),
+      File.join(target_dir, "/")
+    )
+  end
 
   def copy_sources(src_dir, target_dir, pattern = File.join("**", "*"))
     Dir[File.join(src_dir, pattern)].each do |f|
@@ -1551,14 +1597,14 @@ class IconEmbedder < AbstractEmbedder
 
   def resolve_source(uri, expected_ext, download_name)
     file_path = if valid_url?(uri)
-                  download_file(uri, download_name)
-                else
-                  local = File.expand_path(uri)
-                  unless File.exist?(local)
-                    fatal "File does not exist: #{local}"
-                  end
-                  local
-                end
+        download_file(uri, download_name)
+      else
+        local = File.expand_path(uri)
+        unless File.exist?(local)
+          fatal "File does not exist: #{local}"
+        end
+        local
+      end
 
     ext = File.extname(file_path).downcase
 
@@ -1637,7 +1683,6 @@ class LibEmbedder < AbstractEmbedder
 
   def embed
     info "Bundling shared libraries into Emacs.app..."
-
     binary = "#{bin}-bin" if File.exist?("#{bin}-bin")
     binary ||= bin
 
@@ -1646,6 +1691,7 @@ class LibEmbedder < AbstractEmbedder
         "@executable_path", relative_path(File.dirname(binary), lib_dir)
       )
 
+      info "Analyzing binary dependencies..."
       copy, relink = build_bundle_plan(binary)
 
       extra_libs.each do |lib|
@@ -1657,19 +1703,24 @@ class LibEmbedder < AbstractEmbedder
       end
 
       if relink_eln_files && eln_files.any?
-        info "Bundling shared libraries for #{eln_files.size} *.eln files " \
-             "within Emacs.app"
-
-        eln_files.each do |f|
+        info "Analyzing #{eln_files.size} *.eln files for dependencies..."
+        eln_files.each_with_index do |f, idx|
+          debug "Processing eln file #{idx + 1}/#{eln_files.size}" if (idx + 1) % 10 == 0
           eln_copy, eln_relink = build_bundle_plan(f)
           copy.concat(eln_copy)
           relink.concat(eln_relink)
         end
       end
 
-      bundle_libs(copy.uniq, relink.uniq)
+      unique_copy = copy.uniq
+      unique_relink = relink.uniq
+
+      info "Bundling #{unique_copy.size} libraries and relinking #{unique_relink.size} references..."
+      bundle_libs(unique_copy, unique_relink)
       set_rpath(binary, rpath)
     end
+
+    info "Library bundling completed!"
   end
 
   private
@@ -1696,7 +1747,7 @@ class LibEmbedder < AbstractEmbedder
 
     if abs.include?("@rpath")
       abs = rpaths.map { |r| abs.gsub("@rpath", r) }
-              .find { |f| File.exist?(f) }
+        .find { |f| File.exist?(f) }
 
       fatal "Could not resolve path: #{path}" if abs.nil?
     end
@@ -1951,29 +2002,29 @@ class GccInfo
 
   def root_dir
     @root_dir ||= if use_nix?
-                    libgccjit_root_dir
-                  else
-                    `brew --prefix gcc`.chomp
-                  end
+        libgccjit_root_dir
+      else
+        `brew --prefix gcc`.chomp
+      end
   end
 
   def major_version
     @major_version ||= if use_nix?
-                         libgccjit_major_version
-                       else
-                         File.basename(lib_dir)
-                       end
+        libgccjit_major_version
+      else
+        File.basename(lib_dir)
+      end
   end
 
   def lib_dir
     @lib_dir ||= if use_nix?
-                   File.join(root_dir, "lib")
-                 else
-                   Dir[File.join(root_dir, "lib/gcc/*/libgcc*")]
-                     .map { |path| File.dirname(path) }
-                     .select { |path| File.basename(path).match(/^\d+$/) }
-                     .max_by { |path| File.basename(path).to_i }
-                 end
+        File.join(root_dir, "lib")
+      else
+        Dir[File.join(root_dir, "lib/gcc/*/libgcc*")]
+          .map { |path| File.dirname(path) }
+          .select { |path| File.basename(path).match(/^\d+$/) }
+          .max_by { |path| File.basename(path).to_i }
+      end
   end
 
   def target_lib_dir
@@ -2032,54 +2083,71 @@ class GccInfo
 
   def libgccjit_root_dir
     @libgccjit_root_dir ||= if use_nix?
-                              ENV["NIX_LIBGCCJIT_ROOT"]&.strip
-                            else
-                              `brew --prefix libgccjit`.chomp
-                            end
+        ENV["NIX_LIBGCCJIT_ROOT"]&.strip
+      else
+        `brew --prefix libgccjit`.chomp
+      end
   end
 
   def libgccjit_major_version
     @libgccjit_major_version ||= if use_nix?
-      # rubocop:disable Style/SafeNavigationChainLength
-                                   ENV["NIX_LIBGCCJIT_VERSION"]&.strip&.split(".")&.first
-                                   # rubocop:enable Style/SafeNavigationChainLength
-                                 else
-                                   File.basename(libgccjit_lib_dir.to_s)
-                                 end
+        # rubocop:disable Style/SafeNavigationChainLength
+        ENV["NIX_LIBGCCJIT_VERSION"]&.strip&.split(".")&.first
+        # rubocop:enable Style/SafeNavigationChainLength
+      else
+        File.basename(libgccjit_lib_dir.to_s)
+      end
   end
 
   def libgccjit_lib_dir
     @libgccjit_lib_dir ||= if use_nix?
-                             Dir[File.join(libgccjit_root_dir, "lib/libgccjit*.dylib")]
-                               .map { |path| File.dirname(path) }.first
-                           else
-                             Dir[
-                               File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit*.dylib"),
-                               File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit.so*"),
-                               ]
-                               .map { |path| File.dirname(path) }
-                               .select { |path| File.basename(path).match(/^\d+$/) }
-                               .max_by { |path| File.basename(path).to_i }
-                           end
+        Dir[File.join(libgccjit_root_dir, "lib/libgccjit*.dylib")]
+          .map { |path| File.dirname(path) }.first
+      else
+        Dir[
+          File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit*.dylib"),
+          File.join(libgccjit_root_dir, "lib/gcc/*/libgccjit.so*"),
+        ]
+          .map { |path| File.dirname(path) }
+          .select { |path| File.basename(path).match(/^\d+$/) }
+          .max_by { |path| File.basename(path).to_i }
+      end
   end
 
   def verify_libgccjit
-    fatal "gcc not installed" unless Dir.exist?(root_dir)
-    fatal "libgccjit not installed" unless Dir.exist?(libgccjit_root_dir)
+    unless Dir.exist?(root_dir)
+      fatal <<~TEXT
+              GCC not installed.
 
-    if libgccjit_lib_dir.empty?
-      fatal "Detected libgccjit (#{libgccjit_root_dir}) does not have any " \
-            "libgccjit.so* files. Please try reinstalling libgccjit: " \
-            "brew reinstall libgccjit"
+              Install with: brew install gcc
+            TEXT
+    end
+
+    unless Dir.exist?(libgccjit_root_dir)
+      fatal <<~TEXT
+              libgccjit not installed.
+
+              Install with: brew install libgccjit
+            TEXT
+    end
+
+    if libgccjit_lib_dir.nil? || libgccjit_lib_dir.empty?
+      fatal <<~TEXT
+              Detected libgccjit (#{libgccjit_root_dir}) does not have any
+              libgccjit.so* or libgccjit.dylib files.
+
+              Try reinstalling:
+                brew reinstall libgccjit
+
+              Or check installation:
+                brew info libgccjit
+                ls -la #{libgccjit_root_dir}/lib
+            TEXT
     end
 
     if use_nix?
       Dir[File.join(libgccjit_lib_dir, "libgccjit*.dylib")]
         .each { |path| clean_macho_binary(path) }
-
-      # No need to verify gcc vs libgccjit for Nix, as we can pull everything we
-      # need from the libgccjit package. On homebrew we need to pull parts from
-      # gcc and parts from libgccjit, hence we need to ensure versions match.
       return
     end
 
@@ -2087,9 +2155,14 @@ class GccInfo
 
     fatal <<~TEXT
             Detected GCC and libgccjit library paths do not belong to the same major
-            version of GCC. Detected paths:
-              - #{lib_dir}
-              - #{libgccjit_lib_dir}
+            version of GCC.
+
+            Detected paths:
+              - GCC lib:       #{lib_dir} (version #{major_version})
+              - libgccjit lib: #{libgccjit_lib_dir} (version #{libgccjit_major_version})
+
+            Try reinstalling both:
+              brew reinstall gcc libgccjit
           TEXT
   end
 
@@ -2346,6 +2419,7 @@ class CLIOptions
       patches: [],
       log_level: "info",
       clean_macho_binary: nil,
+      quiet: false,  # NEW
     }
   end
 
@@ -2583,6 +2657,14 @@ class CLIOptions
         "--plan FILE",
         "Follow given plan file, instead of using given git ref/sha"
       ) { |v| options[:plan] = v }
+
+      opts.on(
+        "--quiet",
+        "Minimize output (only show warnings and errors)"
+      ) do
+        options[:quiet] = true
+        options[:log_level] = "warn"
+      end
 
       opts.on(
         "--clean-macho-binary FILE",

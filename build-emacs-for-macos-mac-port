@@ -242,7 +242,7 @@ class MacPortBuild < Build
       # Install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       FileUtils.mkdir_p(File.dirname(install_log))
-      
+
       # Run make install and capture output
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
       unless system("sh", "-c", sh_cmd)
