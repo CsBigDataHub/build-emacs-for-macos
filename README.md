@@ -112,6 +112,15 @@ I have successfully built:
 commits from the `jdtsmith/emacs-mac` repository and successfully produces
 working builds on both Intel and Apple Silicon machines.
 
+**Recent Improvements:**
+- GitHub API response caching for faster repeated builds
+- Optimized file copying using rsync for better performance
+- Enhanced progress indicators and status messages
+- Quiet mode for automated builds
+- Build artifact cleanup functionality
+- Better error messages and diagnostics
+- Improved library bundling with progress tracking
+
 For reference, my machine is:
 
 - 14-inch MacBook Pro (2023), Apple M3 Max (16-cores)
@@ -192,8 +201,10 @@ Options:
         --[no-]archive               Enable/disable creating *.tbz archive (default: enabled)
         --[no-]archive-keep-build-dir
                                      Enable/disable keeping source folder for archive (default: disabled)
+        --[no-]cleanup               Clean up old build artifacts (default: disabled)
         --log-level LEVEL            Build script log level (default: info)
         --plan FILE                  Follow given plan file, instead of using given git ref/sha
+        --quiet                      Minimize output (only show warnings and errors)
         --clean-macho-binary FILE    Tool to clean duplicate RPATHs from given Mach-O binary.
 ```
 
@@ -205,6 +216,21 @@ value of how many CPU cores you want it to use.
 
 Re-building the same Git SHA again can yield weird results unless you first
 trash the corresponding directory from the `sources` directory.
+
+### Build Artifact Cleanup
+
+To automatically clean up old build artifacts after a successful build, use the `--cleanup` option:
+
+```bash
+./build-emacs-for-macos emacs-30 --cleanup
+```
+
+This will:
+- Keep only the 3 most recent source trees
+- Keep only the 5 most recent tarballs  
+- Remove cache files older than 7 days
+
+This is useful for maintaining a clean build environment and saving disk space.
 
 ### Examples
 
@@ -305,6 +331,35 @@ fi
 
 If you want `emacs` in your terminal to launch a GUI instance of Emacs, don't
 use the alias from the above example.
+
+## Performance Improvements
+
+The build script includes several performance optimizations:
+
+### GitHub API Caching
+
+GitHub API responses are cached to disk to avoid repeated requests. This significantly speeds up repeated builds of the same branch or commit. Cache files are automatically invalidated after 1 hour or when corrupted.
+
+### Fast Source Copying
+
+C source files are now copied using `rsync` for entire directories when available, which is much faster than individual file copying. This reduces build time when bundling sources for documentation.
+
+### Progress Indicators
+
+Enhanced progress indicators show:
+- Library analysis progress for large numbers of ELN files
+- Clear status messages during compilation and bundling
+- Better feedback during configure and make processes
+
+### Quiet Mode
+
+For automated builds or when you prefer minimal output, use the `--quiet` option:
+
+```bash
+./build-emacs-for-macos emacs-30 --quiet
+```
+
+This minimizes output to only show warnings and errors, making it easier to automate builds and monitor for issues.
 
 ## Native-Comp
 

@@ -251,6 +251,41 @@ class Build
     self_sign_app(app) if options[:self_sign]
 
     archive_build(build_dir) if options[:archive]
+    cleanup_build_artifacts if options[:cleanup]
+  end
+
+  def cleanup_build_artifacts
+    return unless options[:cleanup]
+
+    info 'Cleaning up build artifacts...'
+  
+    # Remove old source trees (keep only latest 3)
+    source_dirs = Dir[File.join(sources_dir, '*')]
+                  .select { |d| File.directory?(d) }
+                  .sort_by { |d| File.mtime(d) }
+                  .reverse
+  
+    source_dirs[3..-1]&.each do |old_dir|
+      info "Removing old source tree: #{File.basename(old_dir)}"
+      FileUtils.rm_rf(old_dir)
+    end
+  
+    # Remove old tarballs (keep only latest 5)
+    tarballs = Dir[File.join(tarballs_dir, '*.tgz')]
+              .sort_by { |f| File.mtime(f) }
+              .reverse
+  
+    tarballs[5..-1]&.each do |old_tar|
+      info "Removing old tarball: #{File.basename(old_tar)}"
+      FileUtils.rm_f(old_tar)
+    end
+  
+    # Remove cache files older than 7 days
+    Dir[File.join(tarballs_dir, '.meta_cache_*.json')].each do |cache|
+      if (Time.now - File.mtime(cache)) > (7 * 24 * 3600)
+        FileUtils.rm_f(cache)
+      end
+    end
   end
 
   def print_info
@@ -2420,6 +2455,7 @@ class CLIOptions
       log_level: "info",
       clean_macho_binary: nil,
       quiet: false,  # NEW
+      cleanup: false,
     }
   end
 
@@ -2647,6 +2683,11 @@ class CLIOptions
         "Enable/disable keeping source folder for archive " \
         "(default: disabled)"
       ) { |v| options[:archive_keep] = v }
+
+      opts.on(
+        "--[no-]cleanup",
+        "Clean up old build artifacts (default: disabled)"
+      ) { |v| options[:cleanup] = v }
 
       opts.on(
         "--log-level LEVEL",
