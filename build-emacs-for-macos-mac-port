@@ -35,51 +35,29 @@ class MacPortBuild < Build
     @github_src_repo ||= options[:github_src_repo] || "jdtsmith/emacs-mac"
   end
 
+  # Override build_name to include "mac-port" identifier in the build name
+  def build_name
+    return @build_name if @build_name
+    return @build_name = options[:build_name] if options[:build_name]
+
+    metadata =
+      [
+        meta[:date]&.strftime("%Y-%m-%d"),
+        meta[:sha][0..6],
+        meta[:ref],
+        "mac-port",
+        "macOS-#{OS.sdk_version}",
+        OS.arch,
+      ].compact.map { |v| v.gsub(/[^\w_-]+/, "-") }
+
+    @build_name = "Emacs.#{metadata.join(".")}"
+  end
+
   # The upstream NS-port helper (macos-startup patch) should NOT be applied
   # to the Mac port. The parent extract_tarball calls apply_macos_startup_patch;
   # override it to no-op.
   def apply_macos_startup_patch(_target)
     info "Skipping NS-port macOS startup patch for Mac-port"
-  end
-
-  # Intercept configure invocation and swap --with-ns for --with-mac so we
-  # keep configure flags otherwise identical to the NS-port flow.
-  def run_cmd(*args, output_file: nil)
-    if args[0] == "./configure"
-      # Ensure CFLAGS are appropriate for mac-port builds unless user provided CFLAGS
-      ENV["CFLAGS"] ||= "-O2 -mcpu=native -mtune=native -fomit-frame-pointer -DFD_SETSIZE=10000 -DDARWIN_UNLIMITED_SELECT"
-
-      # Translate NS flag to Mac port flag
-      args = args.map { |a| a == "--with-ns" ? "--with-mac" : a }
-
-      # Force --enable-mac-app to point at our build output path (override any user value)
-      mac_app_path = File.join(output_dir, build_name)
-      args.reject! { |a| a.start_with?("--enable-mac-app") }
-      args << "--enable-mac-app=#{mac_app_path}"
-
-      # Ensure self-contained build always
-      args.reject! { |a| a == "--enable-mac-self-contained" }
-      args << "--enable-mac-self-contained"
-
-      # Ensure metal backend enabled unless user explicitly set a different mac backend
-      args.reject! { |a| a.start_with?("--with-mac-metal") }
-      args << "--with-mac-metal"
-
-      # Ensure --with-xwidgets present if build requested it via options. The
-      # parent compile_source already includes it in configure_flags when
-      # supported; we don't add it here unconditionally.
-
-      # Prevent configure from setting system-wide prefix (/usr/local). If user
-      # didn't supply a --prefix, set a staging prefix under the output build
-      # directory so `make install` writes into a local tree instead of /usr.
-      unless args.any? { |a| a.start_with?("--prefix=") }
-        staging_prefix = File.join(output_dir, build_name, "staging")
-        FileUtils.mkdir_p(staging_prefix)
-        args << "--prefix=#{staging_prefix}"
-      end
-    end
-
-    super(*args, output_file: output_file)
   end
 
   # Prevent applying NS-port patches. Only user-specified patches are allowed
@@ -123,11 +101,6 @@ class MacPortBuild < Build
     info "Compiling from source. This will take a while..."
 
     FileUtils.cd(source) do
-      # Run autogen if present (mirrors manual steps)
-      if File.exist?("autogen.sh")
-        run_cmd "./autogen.sh"
-      end
-
       # Set up native-comp if requested
       if options[:native_comp]
         info "Compiling with native-comp enabled"
@@ -210,8 +183,8 @@ class MacPortBuild < Build
       run_cmd("make", *make_flags.compact)
 
       # Prepare install staging dirs
-      mac_app_path = File.join(output_dir, build_name, "Emacs.app")
-      frameworks_native_lisp = File.join(mac_app_path, "Contents", "Frameworks", "native-lisp")
+      staged_app_path = File.join(output_dir, build_name, "Emacs.app")
+      frameworks_native_lisp = File.join(staged_app_path, "Contents", "Frameworks", "native-lisp")
       begin
         FileUtils.mkdir_p(frameworks_native_lisp)
         info "Created staging frameworks native-lisp dir: #{frameworks_native_lisp}"
@@ -222,11 +195,11 @@ class MacPortBuild < Build
       # Pre-copy native-lisp if present
       native_lisp_src = File.join(source, "native-lisp")
       if Dir.exist?(native_lisp_src)
-        staging_frameworks = File.join(output_dir, build_name, "Emacs.app", "Contents", "Frameworks")
+        staging_native_lisp = File.join(output_dir, build_name, "Emacs.app", "Contents", "Frameworks", "native-lisp")
         begin
-          FileUtils.mkdir_p(staging_frameworks)
-          info "Copying native-lisp into staging Frameworks dir: #{staging_frameworks}"
-          run_cmd("rsync", "-a", File.join(native_lisp_src, "/"), File.join(staging_frameworks, "/"))
+          FileUtils.mkdir_p(staging_native_lisp)
+          info "Copying native-lisp into staging dir: #{staging_native_lisp}"
+          run_cmd("rsync", "-a", "#{native_lisp_src}/", "#{staging_native_lisp}/")
         rescue => e
           warn "Failed to pre-copy native-lisp: #{e.message}"
         end
@@ -279,13 +252,19 @@ class MacPortBuild < Build
   # (not just a skeleton directory from source extraction)
   def app_has_binary?(app_path)
     return false unless File.exist?(app_path)
-    # Check for the main Emacs binary in standard locations
-    binary_paths = [
-      File.join(app_path, "Contents", "MacOS", "Emacs"),
-      File.join(app_path, "Contents", "MacOS", "Emacs-arm64-11"),
-      File.join(app_path, "Contents", "MacOS", "Emacs-x86_64-10_14"),
-    ]
-    binary_paths.any? { |p| File.exist?(p) && File.file?(p) && !File.symlink?(p) }
+
+    macos_dir = File.join(app_path, "Contents", "MacOS")
+    return false unless File.directory?(macos_dir)
+
+    # Look for the main Emacs binary (not shell scripts or symlinks)
+    # The binary is typically named "Emacs" without extension
+    binary = File.join(macos_dir, "Emacs")
+    return true if File.file?(binary) && !File.symlink?(binary)
+
+    # Also check for architecture-specific variants
+    Dir[File.join(macos_dir, "Emacs-*")].any? do |p|
+      File.file?(p) && !File.symlink?(p)
+    end
   end
 
   # Override create_build_dir to handle cases where `make install` has already
