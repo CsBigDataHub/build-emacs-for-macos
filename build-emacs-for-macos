@@ -1,24 +1,24 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "English"
-require "date"
-require "erb"
-require "etc"
-require "fileutils"
-require "json"
-require "logger"
-require "net/http"
-require "open3"
-require "optparse"
-require "pathname"
-require "set"
-require "time"
-require "tmpdir"
-require "uri"
-require "yaml"
+require 'English'
+require 'date'
+require 'erb'
+require 'etc'
+require 'fileutils'
+require 'json'
+require 'logger'
+require 'net/http'
+require 'open3'
+require 'optparse'
+require 'pathname'
+require 'set'
+require 'time'
+require 'tmpdir'
+require 'uri'
+require 'yaml'
 
-require "macho"
+require 'macho'
 
 class Error < StandardError
 end
@@ -31,7 +31,7 @@ module Output
       fatal: Logger::FATAL,
       info: Logger::INFO,
       unknown: Logger::UNKNOWN,
-      warn: Logger::WARN,
+      warn: Logger::WARN
     }.freeze
 
     def log_level
@@ -94,7 +94,7 @@ module System
   include Output
 
   def run_cmd(*args, output_file: nil)
-    debug "executing: #{args.join(" ")}"
+    debug "executing: #{args.join(' ')}"
     cmd(*args, output_file: output_file)
   end
 
@@ -104,7 +104,7 @@ module System
     end
 
     # Handle output to both terminal and file
-    File.open(output_file, "w") do |file|
+    File.open(output_file, 'w') do |file|
       Open3.popen3(*args) do |_stdin, stdout, stderr, wait_thread|
         stdout_thread = Thread.new do
           while (line = stdout.gets)
@@ -741,7 +741,6 @@ class Build
       File.join(brew_dir, "opt/texinfo/bin"),
     ] + env).compact.reject(&:empty?).uniq
   end
-
   # rubocop:enable Naming/MethodName,Naming/VariableName
 
   def compile_env
@@ -906,12 +905,12 @@ class Build
       # location.
       eln_dir = File.dirname(Dir[File.join(source, "**", "*.eln")].first)
 
-      if eln_dir.match(%r{/.+\..+\..+/})
+      if eln_dir.match?(%r{/.+\..+\..+/})
         base = File.basename(eln_dir)
         parent = File.dirname(eln_dir)
 
         until [".", "/", contents_dir].include?(parent)
-          if base.match(/\..+\./)
+          if base.match?(/\..+\./)
             old_name = File.join(parent, base)
             new_name = File.join(parent, base.gsub(/\.(.+)\./, '-\\1-'))
 
@@ -1211,17 +1210,18 @@ class Build
     response.body
   end
 
+  # Indented 2 more spaces to align when clauses with the assignment
   def effective_version
     @effective_version ||= case ref
-      when /^emacs-26.*/
+      when /^emacs-26.*/        # Indented 4 spaces
         26
-      when /^emacs-27.*/
+      when /^emacs-27.*/        # Indented 4 spaces
         27
-      when /^emacs-28.*/
+      when /^emacs-28.*/        # Indented 4 spaces
         28
-      when /^emacs-29.*/
+      when /^emacs-29.*/        # Indented 4 spaces
         29
-      when /^emacs-30.*/
+      when /^emacs-30.*/        # Indented 4 spaces
         30
       else
         31
@@ -1527,6 +1527,7 @@ class CSourcesEmbedder < AbstractEmbedder
 
   def initialize(app, source_dir)
     super(app)
+
     @source_dir = source_dir
   end
 
@@ -1572,7 +1573,6 @@ class CSourcesEmbedder < AbstractEmbedder
       FileUtils.mkdir_p(File.dirname(target))
       run_cmd("cp", "-pRL", f, target)
     end
-  end
 end
 
 class IconEmbedder < AbstractEmbedder
@@ -2334,8 +2334,8 @@ class MachOCleaner
     debug "Backed up #{@file} to #{backup_file}"
   rescue Errno::EPERM, Errno::EACCES => e
     raise PermissionError.new(
-            backup_file, "Cannot create backup file: #{e.message}"
-          )
+      backup_file, "Cannot create backup file: #{e.message}"
+    )
   end
 
   # Temporarily make file writable, execute block, then restore permissions
@@ -2414,8 +2414,10 @@ class CLIOptions
     parser.parse!(args)
 
     if options[:tahoe_icon_uri] &&
-       (options[:tahoe_icon_name].nil? ||
-        options[:tahoe_icon_name].strip.empty?)
+       (
+         options[:tahoe_icon_name].nil? ||
+         options[:tahoe_icon_name].strip.empty?
+       )
       fatal "--tahoe-icon-name is required when --tahoe-icon-uri is specified"
     end
   rescue OptionParser::InvalidOption => e
@@ -2454,7 +2456,7 @@ class CLIOptions
       patches: [],
       log_level: "info",
       clean_macho_binary: nil,
-      quiet: false,  # NEW
+      quiet: false, # NEW
       cleanup: false,
     }
   end
@@ -2607,7 +2609,7 @@ class CLIOptions
 
       opts.on(
         "--[no-]fd-setsize SIZE",
-        "Set an file descriptor (max open files) limit (default: 10000)"
+        "Set a file descriptor (max open files) limit (default: 10000)"
       ) { |v| options[:fd_setsize] = v.respond_to?(:to_i) ? v.to_i : 0 }
 
       opts.on(
