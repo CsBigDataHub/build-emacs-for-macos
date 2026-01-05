@@ -459,7 +459,7 @@ class Build
     debug "executing: #{args.join(" ")}"
 
     begin
-      output, status = Open3.capture2bin(*args)
+      output, status = Open3.capture2(*args, binmode: true)
     rescue => e
       warn "gh cli failed: #{e.message}, falling back to curl"
       return download_tarball_with_curl(sha, "https://github.com/#{github_src_repo}/tarball/#{sha}", target)
@@ -1573,6 +1573,7 @@ class CSourcesEmbedder < AbstractEmbedder
       FileUtils.mkdir_p(File.dirname(target))
       run_cmd("cp", "-pRL", f, target)
     end
+  end
 end
 
 class IconEmbedder < AbstractEmbedder
