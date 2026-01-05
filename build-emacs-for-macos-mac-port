@@ -25,6 +25,9 @@ class MacPortBuild < Build
       options[:dist_include] = (options[:dist_include] + defaults).uniq
     end
 
+    # Disable rsvg by default for mac-port builds
+    options[:rsvg] = false if options[:rsvg].nil?
+
     super(root_dir, ref, options)
   end
 
@@ -150,9 +153,6 @@ class MacPortBuild < Build
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
-
-      # Ensure CFLAGS are set for mac-port builds if not provided
-      ENV["CFLAGS"] ||= "-O2 -mcpu=native -mtune=native -fomit-frame-pointer -DFD_SETSIZE=10000 -DDARWIN_UNLIMITED_SELECT"
 
       # Run configure
       run_cmd("./configure", *configure_flags.compact, output_file: "configure_output.txt")
