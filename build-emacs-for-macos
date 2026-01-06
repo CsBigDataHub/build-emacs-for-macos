@@ -2019,8 +2019,8 @@ class PathInjector < AbstractEmbedder
       # Sources user shell profiles to inherit PATH and other environment variables
       # This allows Emacs to find tools installed after building, without rebuilding
       
-      # Source shell profiles in priority order
-#{shell_source_lines}
+      # Source shell profiles silently (redirect output to prevent GUI launch issues)
+#{shell_source_lines.map { |line| "      #{line} 2>/dev/null" }.join("\n")}
       
       # Ensure Homebrew paths are present (M1/Intel compatibility)
       # These are prepended to avoid conflicts but still allow user overrides
@@ -2049,15 +2049,15 @@ class PathInjector < AbstractEmbedder
           source "$HOME/#{profile}"
         fi
       LINE
-    end.join("\n")
+    end
   end
 
   def default_shell_sources
     [
-      ".zprofile",      # zsh login shell
+      ".zprofile",      # zsh login shell (best for PATH setup)
       ".zshenv",        # zsh all shells
       ".bash_profile",  # bash login shell
-      ".bashrc",        # bash interactive shell
+      # ".bashrc",      # REMOVED: Interactive only, often has echo/prompts that break GUI launches
       ".profile",       # POSIX sh fallback
     ]
   end
