@@ -248,6 +248,7 @@ class Build
       relink_eln_files: options[:relink_eln],
     ).embed
     GccLibEmbedder.new(app, gcc_info).embed if options[:native_comp]
+    PathInjector.new(app, inject_path: options[:inject_path]).embed if options[:inject_path]
     self_sign_app(app) if options[:self_sign]
 
     archive_build(build_dir) if options[:archive]
@@ -1971,6 +1972,96 @@ class GccLibEmbedder < AbstractEmbedder
     gcc_info.darwin_lib_dir
   end
 end
+class PathInjector < AbstractEmbedder
+  def initialize(app, options = {})
+    super(app)
+    @inject_path = options.fetch(:inject_path, true)
+    @shell_sources = options.fetch(:shell_sources, default_shell_sources)
+  end
+
+  def embed
+    return unless @inject_path
+
+    binary_dir = File.join(app, "Contents", "MacOS")
+    original_binary = File.join(binary_dir, "Emacs")
+    real_binary = File.join(binary_dir, "Emacs.real")
+
+    # Prevent double-wrapping if run twice
+    if File.exist?(real_binary)
+      info "Emacs binary already wrapped, skipping PATH injection..."
+      return
+    end
+
+    info "Injecting dynamic PATH wrapper (emacs-plus style)..."
+    
+    # 1. Rename the actual binary
+    debug "Renaming #{File.basename(original_binary)} to Emacs.real"
+    FileUtils.mv(original_binary, real_binary)
+
+    # 2. Create the wrapper script
+    wrapper_content = generate_wrapper_script
+    
+    # 3. Write the wrapper and make it executable
+    debug "Writing wrapper script to #{File.basename(original_binary)}"
+    File.write(original_binary, wrapper_content)
+    FileUtils.chmod(0755, original_binary)
+
+    info "Dynamic PATH wrapper created successfully"
+    info "Emacs will now source shell environment on every launch"
+  end
+
+  private
+
+  def generate_wrapper_script
+    <<~SCRIPT
+      #!/bin/bash
+      # Dynamic PATH wrapper for Emacs.app
+      # Sources user shell profiles to inherit PATH and other environment variables
+      # This allows Emacs to find tools installed after building, without rebuilding
+      
+      # Source shell profiles in priority order
+#{shell_source_lines}
+      
+      # Ensure Homebrew paths are present (M1/Intel compatibility)
+      # These are prepended to avoid conflicts but still allow user overrides
+      if [ -d "/opt/homebrew/bin" ]; then
+        export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+      fi
+      if [ -d "/usr/local/bin" ]; then
+        export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+      fi
+      
+      # Add standard system paths if not already present
+      export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
+      
+      # Get the directory containing this script
+      DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+      
+      # Execute the real Emacs binary with all arguments
+      exec "$DIR/Emacs.real" "$@"
+    SCRIPT
+  end
+
+  def shell_source_lines
+    @shell_sources.map do |profile|
+      <<~LINE.chomp
+        if [ -f "$HOME/#{profile}" ]; then
+          source "$HOME/#{profile}"
+        fi
+      LINE
+    end.join("\n")
+  end
+
+  def default_shell_sources
+    [
+      ".zprofile",      # zsh login shell
+      ".zshenv",        # zsh all shells
+      ".bash_profile",  # bash login shell
+      ".bashrc",        # bash interactive shell
+      ".profile",       # POSIX sh fallback
+    ]
+  end
+end
 
 class GccInfo
   include Output
@@ -2381,6 +2472,7 @@ class CLIOptions
       patches: [],
       log_level: "info",
       clean_macho_binary: nil,
+      inject_path: true,
     }
   end
 
@@ -2534,6 +2626,12 @@ class CLIOptions
         "--[no-]fd-setsize SIZE",
         "Set an file descriptor (max open files) limit (default: 10000)"
       ) { |v| options[:fd_setsize] = v.respond_to?(:to_i) ? v.to_i : 0 }
+
+      opts.on(
+        "--[no-]inject-path",
+        "Enable/disable dynamic PATH wrapper injection for GUI launches " \
+        "(default: enabled)"
+      ) { |v| options[:inject_path] = v }
 
       opts.on(
         "--github-src-repo REPO",
