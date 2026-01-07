@@ -2195,99 +2195,98 @@ class PathInjector < AbstractEmbedder
   end
 
   def generate_c_wrapper_source
-    # Build shell sourcing logic - EXCLUDE .zshenv to avoid $0 issues
+    # Escape shell profile logic for C string embedding
     shell_profile_logic = shell_source_lines
                             .map { |l| "#{l} 2>/dev/null;" }
                             .join(" ")
                             .gsub('\\', '\\\\\\\\')
                             .gsub('"', '\\"')
 
+    # Use single-quoted heredoc and inject ONLY the profile logic
+    # The real_exe path is handled by the C code itself (no Ruby interpolation needed)
     <<~'C_CODE' % [shell_profile_logic]
-      #include <stdio.h>
-      #include <stdlib.h>
-      #include <string.h>
-      #include <unistd.h>
-      #include <limits.h>
-      #include <mach-o/dyld.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+    #include <limits.h>
+    #include <mach-o/dyld.h>
 
-      int main(int argc, char **argv) {
-          // Get path to this wrapper binary
-          char exe_path[PATH_MAX];
-          uint32_t size = sizeof(exe_path);
-          if (_NSGetExecutablePath(exe_path, &size) != 0) {
-              fprintf(stderr, "Error: Path buffer too small\n");
-              return 1;
-          }
+    int main(int argc, char **argv) {
+        // Get path to this wrapper binary
+        char exe_path[PATH_MAX];
+        uint32_t size = sizeof(exe_path);
+        if (_NSGetExecutablePath(exe_path, &size) != 0) {
+            fprintf(stderr, "Error: Path buffer too small\n");
+            return 1;
+        }
 
-          // Construct path to real binary
-          char real_exe[PATH_MAX];
-          snprintf(real_exe, sizeof(real_exe), "%%s.real", exe_path);
+        // Construct path to real binary
+        char real_exe[PATH_MAX];
+        snprintf(real_exe, sizeof(real_exe), "%%s.real", exe_path);
 
-          // Verify real binary exists
-          if (access(real_exe, X_OK) != 0) {
-              fprintf(stderr, "Error: Cannot find or execute: %%s\n", real_exe);
-              return 1;
-          }
+        // Verify real binary exists
+        if (access(real_exe, X_OK) != 0) {
+            fprintf(stderr, "Error: Cannot find or execute: %%s\n", real_exe);
+            return 1;
+        }
 
-          // Build shell command that:
-          // 1. Sources profiles in isolated manner (prevents $0 leakage)
-          // 2. Collects PATH only
-          // 3. Execs real binary with collected PATH
-          char cmd[16384];
-          int len = snprintf(cmd, sizeof(cmd),
-              // Collect PATH in subshell to isolate $0
-              "COLLECTED_PATH=$("
-              "  set -- bash; "  // Force $0 to be "bash" in subshell
-              "  %%s "            // Source profile logic (injected by Ruby)
-              "  echo \"$PATH\""
-              "); "
-              // Apply collected PATH
-              "export PATH=\"$COLLECTED_PATH\"; "
-              // Ensure Homebrew paths
-              "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH:/usr/bin:/bin:/usr/sbin:/sbin\"; "
-              // Execute real binary
-              "exec '%s' \"$@\"",
-              "%s",  // This %%s becomes the profile_logic placeholder for Ruby
-              real_exe
-          );
+        // Build shell command that:
+        // 1. Sources profiles in isolated subshell (prevents $0 leakage)
+        // 2. Collects PATH only
+        // 3. Execs real binary with collected PATH
+        const char *profile_logic = "%s";
 
-          if (len < 0 || len >= sizeof(cmd)) {
-              fprintf(stderr, "Error: Command buffer overflow\n");
-              return 1;
-          }
+        char cmd[16384];
+        int len = snprintf(cmd, sizeof(cmd),
+            // Collect PATH in subshell to isolate $0
+            "COLLECTED_PATH=$("
+            "  set -- bash; "  // Force $0 to be "bash" in subshell
+            "  %%s "            // Source profile logic
+            "  echo \"$PATH\""
+            "); "
+            // Apply collected PATH
+            "export PATH=\"$COLLECTED_PATH\"; "
+            // Ensure Homebrew paths
+            "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH:/usr/bin:/bin:/usr/sbin:/sbin\"; "
+            // Execute real binary
+            "exec '%%s' \"$@\"",
+            profile_logic,  // First %%s becomes profile_logic
+            real_exe        // Second %%s becomes real_exe path
+        );
 
-          // Build argv for bash execution
-          // argv[0] = /bin/bash
-          // argv[1] = -c
-          // argv[2] = cmd
-          // argv[3] = "Emacs"  <- This becomes $0 in the bash context
-          // argv[4+] = user's original arguments
-          char **new_argv = malloc((argc + 4) * sizeof(char *));
-          if (!new_argv) {
-              perror("malloc");
-              return 1;
-          }
+        if (len < 0 || len >= sizeof(cmd)) {
+            fprintf(stderr, "Error: Command buffer overflow\n");
+            return 1;
+        }
 
-          new_argv[0] = "/bin/bash";
-          new_argv[1] = "-c";
-          new_argv[2] = cmd;
-          new_argv[3] = "Emacs";  // Safe $0 value
+        // Build argv for bash execution
+        char **new_argv = malloc((argc + 4) * sizeof(char *));
+        if (!new_argv) {
+            perror("malloc");
+            return 1;
+        }
 
-          // Copy user arguments
-          for (int i = 1; i < argc; i++) {
-              new_argv[i + 3] = argv[i];
-          }
-          new_argv[argc + 3] = NULL;
+        new_argv[0] = "/bin/bash";
+        new_argv[1] = "-c";
+        new_argv[2] = cmd;
+        new_argv[3] = "Emacs";  // Safe $0 value
 
-          // Execute
-          execv(new_argv[0], new_argv);
+        // Copy user arguments
+        for (int i = 1; i < argc; i++) {
+            new_argv[i + 3] = argv[i];
+        }
+        new_argv[argc + 3] = NULL;
 
-          // Only reached if exec fails
-          perror("execv");
-          free(new_argv);
-          return 1;
-      }
-    C_CODE
+        // Execute
+        execv(new_argv[0], new_argv);
+
+        // Only reached if exec fails
+        perror("execv");
+        free(new_argv);
+        return 1;
+    }
+  C_CODE
   end
 
   def shell_source_lines
