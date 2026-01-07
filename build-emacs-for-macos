@@ -186,10 +186,41 @@ end
 
 class SDKVersion < AbstractVersion
   def load_version
-    ENV.fetch(
-      "MACOSX_DEPLOYMENT_TARGET",
-      `xcrun --show-sdk-version 2>/dev/null`.strip
-    ).strip
+    # Try environment variable first
+    version = ENV["MACOSX_DEPLOYMENT_TARGET"]
+    return version.strip if version && !version.strip.empty?
+
+    # Try xcrun (but it might fail with mismatched SDK paths)
+    version = `xcrun --show-sdk-version 2>/dev/null`.strip
+    return version unless version.empty?
+
+    # Try reading SDKSettings.plist directly as fallback
+    version = read_sdk_version_from_plist
+    return version if version && !version.empty?
+
+    # Last resort: use OS version
+    version = `sw_vers -productVersion`.strip
+    warn "SDK version detection failed, using OS version: #{version}"
+    version
+  end
+
+  private
+
+  def read_sdk_version_from_plist
+    # Try Command Line Tools SDK first
+    sdk_paths = [
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/SDKSettings.plist",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/SDKSettings.plist"
+    ]
+
+    sdk_paths.each do |plist_path|
+      next unless File.exist?(plist_path)
+
+      version = `/usr/libexec/PlistBuddy -c "Print :Version" "#{plist_path}" 2>/dev/null`.strip
+      return version unless version.empty?
+    end
+
+    nil
   end
 end
 
