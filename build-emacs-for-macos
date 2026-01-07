@@ -2067,9 +2067,10 @@ class PathInjector < AbstractEmbedder
   private
 
   # Reads the Mach-O header to determine which -arch flags to pass to clang
+  # Uses MachO.open which works in modern versions of the ruby-macho gem
   def get_arch_flags(binary_path)
     begin
-      file = MachO::File.new(binary_path)
+      file = MachO.open(binary_path)
 
       # Helper to map MachO CPU constants (symbols) to Clang strings
       # e.g., :arm64 -> "arm64", :x86_64 -> "x86_64"
