@@ -2032,7 +2032,6 @@ class PathInjector < AbstractEmbedder
     File.write(wrapper_source, generate_c_wrapper_source)
 
     # 5. Compile the wrapper
-    #    We use the detected flags to ensure the wrapper matches the app binary exactly.
     debug "Compiling native wrapper..."
     compile_cmd = [
       "clang",
@@ -2055,8 +2054,6 @@ class PathInjector < AbstractEmbedder
     FileUtils.rm(wrapper_source)
 
     # 7. Re-sign the REAL binary
-    #    Moving a file invalidates its ad-hoc signature. We must re-sign it
-    #    so the wrapper can execute it without Security blocking it.
     info "Signing real binary..."
     system("codesign", "--force", "--deep", "--sign", "-", real_binary)
 
@@ -2066,40 +2063,28 @@ class PathInjector < AbstractEmbedder
   private
 
   # Reads the Mach-O header to determine which -arch flags to pass to clang
-  # Handles both Symbols (modern helpers) and Integers (standard ruby-macho return)
   def get_arch_flags(binary_path)
     begin
       file = MachO.open(binary_path)
       archs = []
 
-      # Collect architectures from the binary
       if file.is_a?(MachO::FatFile)
-        # Universal Binary: map all slices
         archs = file.machos.map(&:cputype)
       else
-        # Single Arch Binary
         archs = [file.cputype]
       end
 
-      # Convert ruby-macho symbols (e.g., :x86_64, :arm64) or Integers to Clang flags
-      # We use .to_s to handle both Symbols and Integers gracefully
       flags = archs.map do |arch|
-      arch_name = arch.to_s.gsub(/^:/, '') # Ensure no leading colon if it was a symbol
-
-      # Mapping just in case, though usually unnecessary for arm64/x86_64
+      arch_name = arch.to_s.gsub(/^:/, '')
       case arch_name
       when "arm64", "16777228" then "arm64"
       when "x86_64", "16777223" then "x86_64"
       when "i386", "7"          then "i386"
-      else arch_name # Fallback: trust the symbol name
+      else arch_name
       end
     end.uniq
 
-      debug "Detected architectures: #{flags.join(', ')}"
-
-      # Format as ["-arch", "arm64", "-arch", "x86_64"]
       flags.flat_map { |a| ["-arch", a] }
-
     rescue MachO::NotAMachOError, MachO::TruncatedFileError => e
       fatal "Failed to parse Mach-O binary: #{e.message}"
       exit 1
@@ -2107,11 +2092,11 @@ class PathInjector < AbstractEmbedder
   end
 
   def generate_c_wrapper_source
-    # Generate the shell snippet for sourcing user profiles
-    # We use escaped quotes so the C string renders correctly into bash syntax
+    # Prepare the shell logic
     shell_profile_logic = shell_source_lines.map { |l| "#{l} 2>/dev/null;" }.join(" ")
 
-    # Embed the logic into a C program
+    # We use #{shell_profile_logic} interpolation here.
+    # Note: $PATH and $@ are preserved because Ruby interpolation only affects #{...}.
     <<~C_CODE
       #include <stdio.h>
       #include <stdlib.h>
@@ -2133,28 +2118,31 @@ class PathInjector < AbstractEmbedder
           char real_exe[PATH_MAX];
           snprintf(real_exe, sizeof(real_exe), "%s.real", exe_path);
 
-          // 3. Define Environment Logic
-          // A. Shell Profile sourcing (from Ruby)
+          // 3. Define Shell Logic
           const char *profile_logic = "#{shell_profile_logic}";
 
-          // B. Homebrew / System PATH logic
           const char *path_logic =
             "if [ -d /opt/homebrew/bin ]; then export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH; fi; "
             "if [ -d /usr/local/bin ]; then export PATH=/usr/local/bin:/usr/local/sbin:$PATH; fi; "
             "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin";
 
-          // C. Combine into one bash command string
+          // 4. Combine into one bash command
+          // We embed real_exe (%%s) directly into the command string.
+          // We use "$@" to pass arguments.
           char cmd[8192];
-          int required_len = snprintf(cmd, sizeof(cmd), "%s %s exec \\"$0\\" \\"$@\\"", profile_logic, path_logic);
+          int required_len = snprintf(cmd, sizeof(cmd),
+              "%s %s exec \\"%s\\" \\"$@\\"",
+              profile_logic, path_logic, real_exe);
 
-          // Safety Check: If required_len >= sizeof(cmd), the command was truncated.
           if (required_len < 0 || required_len >= (int)sizeof(cmd)) {
-              fprintf(stderr, "Error: Generated shell command exceeds buffer size. Truncated.\\n");
-              fprintf(stderr, "Check your PATH or profile file lengths.\\n");
+              fprintf(stderr, "Error: Generated shell command exceeds buffer size.\\n");
               return 1;
           }
 
-          // 4. Prepare arguments for execv("/bin/bash")
+          // 5. Prepare arguments for /bin/bash
+          // We construct: /bin/bash -c "cmd" "Emacs" "arg1" "arg2"...
+          // "Emacs" becomes $0 (Safe Name)
+          // "arg1"  becomes $1
           char **new_argv = malloc((argc + 4) * sizeof(char *));
           if (!new_argv) {
               perror("malloc failed");
@@ -2164,19 +2152,17 @@ class PathInjector < AbstractEmbedder
           new_argv[0] = "/bin/bash";
           new_argv[1] = "-c";
           new_argv[2] = cmd;
-          new_argv[3] = real_exe; // This becomes $0 in the bash script
+          new_argv[3] = "Emacs"; // Safe $0 to prevent profile script errors
 
-          // 5. Copy original arguments (skipping the wrapper's argv[0])
+          // Copy original arguments starting from argv[1]
           for (int i = 1; i < argc; i++) {
               new_argv[i + 3] = argv[i];
           }
-          new_argv[argc + 3] = NULL; // Null-terminate the array
+          new_argv[argc + 3] = NULL;
 
           // 6. Execute
           execv(new_argv[0], new_argv);
-
-          // If execv returns, an error occurred
-          perror("execv failed to launch Emacs.real");
+          perror("execv failed");
           free(new_argv);
           return 1;
       }
@@ -2185,8 +2171,7 @@ class PathInjector < AbstractEmbedder
 
   def shell_source_lines
     @shell_sources.map do |profile|
-      # Escaping strategy:
-      # Ruby " \\\" " -> C Source \" -> Bash "
+      # Escape double quotes for C string compatibility
       "if [ -f \\\"$HOME/#{profile}\\\" ]; then source \\\"$HOME/#{profile}\\\"; fi"
     end
   end
