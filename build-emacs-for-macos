@@ -1543,6 +1543,10 @@ class IconEmbedder < AbstractEmbedder
   def embed
     handle_icns if present?(@icon_uri)
     handle_tahoe if present?(@tahoe_icon_uri)
+    
+    # CRITICAL FIX: Remove quarantine flags and refresh icon cache
+    # This prevents the icon from appearing greyed out in Finder
+    refresh_bundle_metadata
   ensure
     cleanup_tmpdir
   end
@@ -1655,6 +1659,21 @@ class IconEmbedder < AbstractEmbedder
     return unless @tmpdir
 
     FileUtils.rm_rf(@tmpdir)
+  end
+
+  def refresh_bundle_metadata
+    info "Refreshing application bundle metadata to fix icon display..."
+    
+    # 1. Remove 'com.apple.quarantine' attributes.
+    # Downloaded files (via curl) are flagged as unsafe. macOS refuses to
+    # render the icon if this flag is present on the .icns or .app bundle.
+    # The '-cr' flag clears all extended attributes recursively.
+    run_cmd("xattr", "-cr", app)
+
+    # 2. Update the modification time of the .app bundle.
+    # This forces Finder and LaunchServices to re-read the bundle Info.plist
+    # and recognize the icon changes immediately.
+    run_cmd("touch", app)
   end
 end
 
