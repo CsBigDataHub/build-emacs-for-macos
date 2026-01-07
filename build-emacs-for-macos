@@ -2120,7 +2120,6 @@ class PathInjector < AbstractEmbedder
   def initialize(app, options = {})
     super(app)
     @inject_path = options.fetch(:inject_path, true)
-    @shell_sources = options.fetch(:shell_sources, default_shell_sources)
   end
 
   def embed
@@ -2139,7 +2138,7 @@ class PathInjector < AbstractEmbedder
       fatal "Could not find original binary at #{original_binary}"
     end
 
-    info "Injecting native C PATH wrapper (Mach-O compatible)..."
+    info "Injecting Universal Native Wrapper (Bash/Zsh/Fish/Ksh)..."
 
     debug "Renaming original binary to Emacs.real"
     FileUtils.mv(original_binary, real_binary)
@@ -2172,7 +2171,7 @@ class PathInjector < AbstractEmbedder
     info "Signing wrapper binary..."
     system("codesign", "--force", "--deep", "--sign", "-", original_binary)
 
-    info "Native PATH wrapper installed successfully"
+    info "Universal wrapper installed successfully"
   end
 
   private
@@ -2195,113 +2194,110 @@ class PathInjector < AbstractEmbedder
   end
 
   def generate_c_wrapper_source
-    # Escape shell profile logic for C string embedding
-    shell_profile_logic = shell_source_lines
-                            .map { |l| "#{l} 2>/dev/null;" }
-                            .join(" ")
-                            .gsub('\\', '\\\\\\\\')
-                            .gsub('"', '\\"')
+    # Using single-quoted heredoc to avoid Ruby interpolation complications,
+    # allowing the C code to stand clearly.
+    <<~'C_CODE'
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+      #include <unistd.h>
+      #include <limits.h>
+      #include <mach-o/dyld.h>
+      #include <pwd.h>
+      #include <sys/types.h>
 
-    # Use single-quoted heredoc and inject ONLY the profile logic
-    # The real_exe path is handled by the C code itself (no Ruby interpolation needed)
-    <<~'C_CODE' % [shell_profile_logic]
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <string.h>
-    #include <unistd.h>
-    #include <limits.h>
-    #include <mach-o/dyld.h>
+      int main(int argc, char **argv) {
+          // 1. Get path to this wrapper
+          char exe_path[PATH_MAX];
+          uint32_t size = sizeof(exe_path);
+          if (_NSGetExecutablePath(exe_path, &size) != 0) {
+              return 1;
+          }
 
-    int main(int argc, char **argv) {
-        // Get path to this wrapper binary
-        char exe_path[PATH_MAX];
-        uint32_t size = sizeof(exe_path);
-        if (_NSGetExecutablePath(exe_path, &size) != 0) {
-            fprintf(stderr, "Error: Path buffer too small\n");
-            return 1;
-        }
+          // 2. Determine path to real binary
+          char real_exe[PATH_MAX];
+          snprintf(real_exe, sizeof(real_exe), "%s.real", exe_path);
 
-        // Construct path to real binary
-        char real_exe[PATH_MAX];
-        snprintf(real_exe, sizeof(real_exe), "%%s.real", exe_path);
+          if (access(real_exe, X_OK) != 0) {
+              fprintf(stderr, "Error: Cannot execute %s\n", real_exe);
+              return 1;
+          }
 
-        // Verify real binary exists
-        if (access(real_exe, X_OK) != 0) {
-            fprintf(stderr, "Error: Cannot find or execute: %%s\n", real_exe);
-            return 1;
-        }
+          // 3. Detect User's Shell (More robust than $SHELL env var)
+          struct passwd *pw = getpwuid(getuid());
+          const char *shell = (pw && pw->pw_shell) ? pw->pw_shell : "/bin/zsh";
 
-        // Build shell command that:
-        // 1. Sources profiles in isolated subshell (prevents $0 leakage)
-        // 2. Collects PATH only
-        // 3. Execs real binary with collected PATH
-        const char *profile_logic = "%s";
+          // Check if shell is Fish
+          int is_fish = 0;
+          size_t shell_len = strlen(shell);
+          if (shell_len >= 4 && strcmp(shell + shell_len - 4, "fish") == 0) {
+              is_fish = 1;
+          }
 
-        char cmd[16384];
-        int len = snprintf(cmd, sizeof(cmd),
-            // Collect PATH in subshell to isolate $0
-            "COLLECTED_PATH=$("
-            "  set -- bash; "  // Force $0 to be "bash" in subshell
-            "  %%s "            // Source profile logic
-            "  echo \"$PATH\""
-            "); "
-            // Apply collected PATH
-            "export PATH=\"$COLLECTED_PATH\"; "
-            // Ensure Homebrew paths
-            "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH:/usr/bin:/bin:/usr/sbin:/sbin\"; "
-            // Execute real binary
-            "exec '%%s' \"$@\"",
-            profile_logic,  // First %%s becomes profile_logic
-            real_exe        // Second %%s becomes real_exe path
-        );
+          // 4. Build Command String
+          char cmd[16384];
+          int len = 0;
 
-        if (len < 0 || len >= sizeof(cmd)) {
-            fprintf(stderr, "Error: Command buffer overflow\n");
-            return 1;
-        }
+          if (is_fish) {
+              // FISH SYNTAX
+              len = snprintf(cmd, sizeof(cmd),
+                  "if test -d /opt/homebrew/bin; set -x PATH /opt/homebrew/bin /opt/homebrew/sbin $PATH; end; "
+                  "if test -d /usr/local/bin; set -x PATH /usr/local/bin /usr/local/sbin $PATH; end; "
+                  "set -x PATH $PATH /usr/bin /bin /usr/sbin /sbin; "
+                  "set -e EMACSLOADPATH; set -e EMACSDATA; set -e EMACSPATH; set -e EMACSDOC; set -e INFOPATH; "
+                  "exec \"%s\" $argv",
+                  real_exe);
+          } else {
+              // POSIX SYNTAX (Bash, Zsh, Ksh, Sh)
+              len = snprintf(cmd, sizeof(cmd),
+                  "if [ -d /opt/homebrew/bin ]; then export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH; fi; "
+                  "if [ -d /usr/local/bin ]; then export PATH=/usr/local/bin:/usr/local/sbin:$PATH; fi; "
+                  "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin; "
+                  "unset EMACSLOADPATH EMACSDATA EMACSPATH EMACSDOC INFOPATH; "
+                  "exec \"%s\" \"$@\"",
+                  real_exe);
+          }
 
-        // Build argv for bash execution
-        char **new_argv = malloc((argc + 4) * sizeof(char *));
-        if (!new_argv) {
-            perror("malloc");
-            return 1;
-        }
+          if (len < 0 || len >= sizeof(cmd)) {
+              fprintf(stderr, "Error: Command buffer overflow\n");
+              return 1;
+          }
 
-        new_argv[0] = "/bin/bash";
-        new_argv[1] = "-c";
-        new_argv[2] = cmd;
-        new_argv[3] = "Emacs";  // Safe $0 value
+          // 5. Prepare Exec Arguments
+          // Allocate size = shell + -l + -c + cmd + args + NULL
+          char **new_argv = malloc((argc + 5) * sizeof(char *));
+          if (!new_argv) { return 1; }
 
-        // Copy user arguments
-        for (int i = 1; i < argc; i++) {
-            new_argv[i + 3] = argv[i];
-        }
-        new_argv[argc + 3] = NULL;
+          new_argv[0] = (char *)shell;
+          new_argv[1] = "-l";  // Login shell: forces loading of profile/rc files
+          new_argv[2] = "-c";
+          new_argv[3] = cmd;
 
-        // Execute
-        execv(new_argv[0], new_argv);
+          if (is_fish) {
+              // Fish does not use $0 argument position like POSIX shells
+              // Arguments start immediately after the command string
+              for (int i = 1; i < argc; i++) {
+                  new_argv[i + 3] = argv[i];
+              }
+              new_argv[argc + 3] = NULL;
+          } else {
+              // POSIX: First arg after -c is assigned to $0
+              new_argv[4] = "Emacs"; // Safe $0 name
+              for (int i = 1; i < argc; i++) {
+                  new_argv[i + 4] = argv[i];
+              }
+              new_argv[argc + 4] = NULL;
+          }
 
-        // Only reached if exec fails
-        perror("execv");
-        free(new_argv);
-        return 1;
-    }
-  C_CODE
-  end
+          // 6. Launch
+          execv(shell, new_argv);
 
-  def shell_source_lines
-    @shell_sources.map do |profile|
-      # Triple-escape for: Ruby -> C string -> Bash string
-      "if [ -f \\\"$HOME/#{profile}\\\" ]; then source \\\"$HOME/#{profile}\\\"; fi"
-    end
-  end
-
-  def default_shell_sources
-    [
-      ".zprofile",      # zsh login shell (best for PATH)
-      ".zshenv",        # zsh all shells (NOW SAFE with set -- bash isolation)
-      ".profile",       # POSIX fallback
-    ]
+          // Fallback if user shell is broken/missing
+          perror("execv failed");
+          free(new_argv);
+          return 1;
+      }
+    C_CODE
   end
 end
 
