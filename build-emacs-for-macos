@@ -2024,7 +2024,6 @@ class PathInjector < AbstractEmbedder
     FileUtils.mv(original_binary, real_binary)
 
     # 3. Determine the exact architecture flags needed for compilation
-    #    This supports single-arch binaries and Universal Binaries (Fat files)
     arch_flags = get_arch_flags(real_binary)
     debug "Detected architecture flags: #{arch_flags.join(' ')}"
 
@@ -2040,7 +2039,7 @@ class PathInjector < AbstractEmbedder
       *arch_flags,
       "-O2",
       "-Wall",
-      "-o", original_binary, # Output to the original 'Emacs' path
+      "-o", original_binary,
       wrapper_source
     ]
 
@@ -2067,27 +2066,40 @@ class PathInjector < AbstractEmbedder
   private
 
   # Reads the Mach-O header to determine which -arch flags to pass to clang
-  # Uses MachO.open which works in modern versions of the ruby-macho gem
+  # Handles both Symbols (modern helpers) and Integers (standard ruby-macho return)
   def get_arch_flags(binary_path)
     begin
       file = MachO.open(binary_path)
+      archs = []
 
-      # Helper to map MachO CPU constants (symbols) to Clang strings
-      # e.g., :arm64 -> "arm64", :x86_64 -> "x86_64"
-      cputype_to_str = ->(type) { MachO.cputype_sym(type).to_s }
-
+      # Collect architectures from the binary
       if file.is_a?(MachO::FatFile)
-        # Handle Universal Binaries (contains multiple architectures)
-        # We must compile a wrapper that contains ALL architectures present in the fat binary.
-        flags = file.machos.map { |m| ["-arch", cputype_to_str.call(m.cputype)] }.flatten.uniq
-        debug "Universal binary detected: #{file.machos.map(&:cputype).map(&cputype_to_str).join(', ')}"
-        flags
+        # Universal Binary: map all slices
+        archs = file.machos.map(&:cputype)
       else
-        # Single Architecture Binary
-        arch_str = cputype_to_str.call(file.cputype)
-        debug "Single architecture binary detected: #{arch_str}"
-        ["-arch", arch_str]
+        # Single Arch Binary
+        archs = [file.cputype]
       end
+
+      # Convert ruby-macho symbols (e.g., :x86_64, :arm64) or Integers to Clang flags
+      # We use .to_s to handle both Symbols and Integers gracefully
+      flags = archs.map do |arch|
+      arch_name = arch.to_s.gsub(/^:/, '') # Ensure no leading colon if it was a symbol
+
+      # Mapping just in case, though usually unnecessary for arm64/x86_64
+      case arch_name
+      when "arm64", "16777228" then "arm64"
+      when "x86_64", "16777223" then "x86_64"
+      when "i386", "7"          then "i386"
+      else arch_name # Fallback: trust the symbol name
+      end
+    end.uniq
+
+      debug "Detected architectures: #{flags.join(', ')}"
+
+      # Format as ["-arch", "arm64", "-arch", "x86_64"]
+      flags.flat_map { |a| ["-arch", a] }
+
     rescue MachO::NotAMachOError, MachO::TruncatedFileError => e
       fatal "Failed to parse Mach-O binary: #{e.message}"
       exit 1
@@ -2132,12 +2144,17 @@ class PathInjector < AbstractEmbedder
             "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin";
 
           // C. Combine into one bash command string
-          // Structure: { profiles } && { path_setup } && exec "$0" "$@"
           char cmd[8192];
-          snprintf(cmd, sizeof(cmd), "%s %s exec \\"$0\\" \\"$@\\"", profile_logic, path_logic);
+          int required_len = snprintf(cmd, sizeof(cmd), "%s %s exec \\"$0\\" \\"$@\\"", profile_logic, path_logic);
+
+          // Safety Check: If required_len >= sizeof(cmd), the command was truncated.
+          if (required_len < 0 || required_len >= (int)sizeof(cmd)) {
+              fprintf(stderr, "Error: Generated shell command exceeds buffer size. Truncated.\\n");
+              fprintf(stderr, "Check your PATH or profile file lengths.\\n");
+              return 1;
+          }
 
           // 4. Prepare arguments for execv("/bin/bash")
-          // We need: /bin/bash -c "cmd" "real_exe_path" "arg1" "arg2" ...
           char **new_argv = malloc((argc + 4) * sizeof(char *));
           if (!new_argv) {
               perror("malloc failed");
