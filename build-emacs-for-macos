@@ -1543,7 +1543,7 @@ class IconEmbedder < AbstractEmbedder
   def embed
     handle_icns if present?(@icon_uri)
     handle_tahoe if present?(@tahoe_icon_uri)
-    
+
     # CRITICAL FIX: Remove quarantine flags and refresh icon cache
     # This prevents the icon from appearing greyed out in Finder
     refresh_bundle_metadata
@@ -1663,7 +1663,7 @@ class IconEmbedder < AbstractEmbedder
 
   def refresh_bundle_metadata
     info "Refreshing application bundle metadata to fix icon display..."
-    
+
     # 1. Remove 'com.apple.quarantine' attributes.
     # Downloaded files (via curl) are flagged as unsafe. macOS refuses to
     # render the icon if this flag is present on the .icns or .app bundle.
@@ -1991,6 +1991,7 @@ class GccLibEmbedder < AbstractEmbedder
     gcc_info.darwin_lib_dir
   end
 end
+
 class PathInjector < AbstractEmbedder
   def initialize(app, options = {})
     super(app)
@@ -2005,79 +2006,161 @@ class PathInjector < AbstractEmbedder
     original_binary = File.join(binary_dir, "Emacs")
     real_binary = File.join(binary_dir, "Emacs.real")
 
-    # Prevent double-wrapping if run twice
+    # Prevent double-wrapping
     if File.exist?(real_binary)
       info "Emacs binary already wrapped, skipping PATH injection..."
       return
     end
 
-    info "Injecting dynamic PATH wrapper (emacs-plus style)..."
-    
+    info "Injecting native C PATH wrapper..."
+
     # 1. Rename the actual binary
     debug "Renaming #{File.basename(original_binary)} to Emacs.real"
     FileUtils.mv(original_binary, real_binary)
 
-    # 2. Create the wrapper script
-    wrapper_content = generate_wrapper_script
-    
-    # 3. Write the wrapper and make it executable
-    debug "Writing wrapper script to #{File.basename(original_binary)}"
-    File.write(original_binary, wrapper_content)
-    FileUtils.chmod(0755, original_binary)
+    # 2. Detect architecture of the real binary
+    arch = detect_arch(real_binary)
+    debug "Detected architecture: #{arch}"
 
-    info "Dynamic PATH wrapper created successfully"
-    info "Emacs will now source shell environment on every launch"
+    # 3. Generate C source
+    wrapper_source = File.join(binary_dir, "wrapper.c")
+    File.write(wrapper_source, generate_c_wrapper_source)
+
+    # 4. Compile the wrapper matching the real binary's architecture
+    #    We explicitly pass -arch to ensure the wrapper matches the app.
+    debug "Compiling native wrapper (#{arch})..."
+    compile_cmd = [
+      "clang",
+      "-arch", arch,           # <--- CRITICAL FIX
+      "-O2",
+      "-Wall",
+      "-o", original_binary,
+      wrapper_source
+    ]
+
+    unless system(*compile_cmd)
+      fatal "Failed to compile native wrapper. Is clang installed?"
+    end
+
+    # 5. Clean up
+    FileUtils.rm(wrapper_source)
+
+    # 6. Re-sign the real binary
+    #    Moving a file breaks its signature. We must re-sign it.
+    #    The wrapper inherits the app's signature later, but Emacs.real needs
+    #    to be validly signed to be executed.
+    info "Signing real binary..."
+    system("codesign", "--force", "--deep", "--sign", "-", real_binary)
+
+    info "Native PATH wrapper installed successfully"
   end
 
   private
 
-  def generate_wrapper_script
-    <<~SCRIPT
-      #!/bin/bash
-      # Dynamic PATH wrapper for Emacs.app
-      # Sources user shell profiles to inherit PATH and other environment variables
-      # This allows Emacs to find tools installed after building, without rebuilding
-      
-      # Source shell profiles silently (redirect output to prevent GUI launch issues)
-#{shell_source_lines.map { |line| "      #{line} 2>/dev/null" }.join("\n")}
-      
-      # Ensure Homebrew paths are present (M1/Intel compatibility)
-      # These are prepended to avoid conflicts but still allow user overrides
-      if [ -d "/opt/homebrew/bin" ]; then
-        export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-      fi
-      if [ -d "/usr/local/bin" ]; then
-        export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
-      fi
-      
-      # Add standard system paths if not already present
-      export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
-      
-      # Get the directory containing this script
-      DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-      
-      # Execute the real Emacs binary with all arguments
-      exec "$DIR/Emacs.real" "$@"
-    SCRIPT
+  def detect_arch(binary_path)
+    # Parse `file` output to find "arm64" or "x86_64"
+    file_output = `file #{binary_path}`.strip
+    if file_output.include?("arm64")
+      "arm64"
+    elsif file_output.include?("x86_64")
+      "x86_64"
+    else
+      raise "Unknown architecture for #{binary_path}: #{file_output}"
+    end
+  end
+
+  def generate_c_wrapper_source
+    # Combine the shell logic into one command string
+    # Note: Your escaping logic in the original post was actually correct (\\\" -> \"),
+    # but ensuring the string is valid C is key.
+    shell_profile_logic = shell_source_lines.map { |l| "#{l} 2>/dev/null;" }.join(" ")
+
+    <<~C_CODE
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+      #include <unistd.h>
+      #include <limits.h>
+      #include <mach-o/dyld.h>
+      #include <sys/wait.h>
+
+      int main(int argc, char **argv) {
+          // 1. Get the path of this executable (Emacs)
+          char exe_path[PATH_MAX];
+          uint32_t size = sizeof(exe_path);
+          if (_NSGetExecutablePath(exe_path, &size) != 0) {
+              fprintf(stderr, "Buffer too small; need size %u\\n", size);
+              return 1;
+          }
+
+          // 2. Construct the path to the real binary (Emacs.real)
+          char real_exe[PATH_MAX];
+          snprintf(real_exe, sizeof(real_exe), "%s.real", exe_path);
+
+          // 3. Construct the shell command
+          // We inject the ruby-generated shell logic here
+          const char *profile_logic = "#{shell_profile_logic}";
+
+          const char *path_logic =
+            "if [ -d /opt/homebrew/bin ]; then export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH; fi; "
+            "if [ -d /usr/local/bin ]; then export PATH=/usr/local/bin:/usr/local/sbin:$PATH; fi; "
+            "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin";
+
+          // Buffer for the full command
+          char cmd[8192];
+          snprintf(cmd, sizeof(cmd), "%s %s exec \\"$0\\" \\"$@\\"", profile_logic, path_logic);
+
+          // 4. Prepare arguments for bash
+          // We need: /bin/bash -c "cmd" "real_exe" [args...]
+          // Size = bash + -c + cmd + real_exe + argc (original args) + NULL
+          // Note: argc includes the executable name (argv[0]), but we want to pass
+          // the original arguments starting from index 1.
+
+          char **new_argv = malloc((argc + 4) * sizeof(char *));
+          if (!new_argv) {
+              perror("malloc failed");
+              return 1;
+          }
+
+          new_argv[0] = "/bin/bash";
+          new_argv[1] = "-c";
+          new_argv[2] = cmd;
+          new_argv[3] = real_exe; // This becomes $0 inside the bash script
+
+          // Copy original arguments (starting from 1)
+          for (int i = 1; i < argc; i++) {
+              new_argv[i + 3] = argv[i];
+          }
+          new_argv[argc + 3] = NULL;
+
+          // 5. Execute
+          execv(new_argv[0], new_argv);
+
+          // If execv returns, an error occurred
+          perror("execv failed");
+          free(new_argv);
+          return 1;
+      }
+    C_CODE
   end
 
   def shell_source_lines
     @shell_sources.map do |profile|
-      <<~LINE.chomp
-        if [ -f "$HOME/#{profile}" ]; then
-          source "$HOME/#{profile}"
-        fi
-      LINE
+      # Escaping:
+      # Ruby " \" -> String: "
+      # C String: \" -> Char: "
+      # Bash: "
+      # Result: if [ -f "$HOME/.zprofile" ]; ...
+      "if [ -f \\\"$HOME/#{profile}\\\" ]; then source \\\"$HOME/#{profile}\\\"; fi"
     end
   end
 
   def default_shell_sources
     [
-      ".zprofile",      # zsh login shell (best for PATH setup)
-      ".zshenv",        # zsh all shells
-      ".bash_profile",  # bash login shell
-      # ".bashrc",      # REMOVED: Interactive only, often has echo/prompts that break GUI launches
-      ".profile",       # POSIX sh fallback
+      ".zprofile",
+      ".zshrc",        # Added .zshrc as it's common for non-login interactive shells
+      ".bash_profile",
+      ".profile",
     ]
   end
 end
