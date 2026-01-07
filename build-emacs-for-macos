@@ -2025,97 +2025,6 @@ end
 
 # Bash wrapper for PathInjector
 # this is what emacs plus uses
-# class PathInjector < AbstractEmbedder
-#   def initialize(app, options = {})
-#     super(app)
-#     @inject_path = options.fetch(:inject_path, true)
-#     @shell_sources = options.fetch(:shell_sources, default_shell_sources)
-#   end
-
-#   def embed
-#     return unless @inject_path
-
-#     binary_dir = File.join(app, "Contents", "MacOS")
-#     original_binary = File.join(binary_dir, "Emacs")
-#     real_binary = File.join(binary_dir, "Emacs.real")
-
-#     # Prevent double-wrapping if run twice
-#     if File.exist?(real_binary)
-#       info "Emacs binary already wrapped, skipping PATH injection..."
-#       return
-#     end
-
-#     info "Injecting dynamic PATH wrapper (emacs-plus style)..."
-
-#     # 1. Rename the actual binary
-#     debug "Renaming #{File.basename(original_binary)} to Emacs.real"
-#     FileUtils.mv(original_binary, real_binary)
-
-#     # 2. Create the wrapper script
-#     wrapper_content = generate_wrapper_script
-
-#     # 3. Write the wrapper and make it executable
-#     debug "Writing wrapper script to #{File.basename(original_binary)}"
-#     File.write(original_binary, wrapper_content)
-#     FileUtils.chmod(0755, original_binary)
-
-#     info "Dynamic PATH wrapper created successfully"
-#     info "Emacs will now source shell environment on every launch"
-#   end
-
-#   private
-
-#   def generate_wrapper_script
-#     <<~SCRIPT
-#       #!/bin/bash
-#       # Dynamic PATH wrapper for Emacs.app
-#       # Sources user shell profiles to inherit PATH and other environment variables
-#       # This allows Emacs to find tools installed after building, without rebuilding
-
-#       # Source shell profiles silently (redirect output to prevent GUI launch issues)
-# #{shell_source_lines.map { |line| "      #{line} 2>/dev/null" }.join("\n")}
-
-#       # Ensure Homebrew paths are present (M1/Intel compatibility)
-#       # These are prepended to avoid conflicts but still allow user overrides
-#       if [ -d "/opt/homebrew/bin" ]; then
-#         export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-#       fi
-#       if [ -d "/usr/local/bin" ]; then
-#         export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
-#       fi
-
-#       # Add standard system paths if not already present
-#       export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
-
-#       # Get the directory containing this script (fully portable)
-#       DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-
-#       # Execute the real Emacs binary with all arguments
-#       exec "$DIR/Emacs.real" "$@"
-#     SCRIPT
-#   end
-
-#   def shell_source_lines
-#     @shell_sources.map do |profile|
-#       <<~LINE.chomp
-#         if [ -f "$HOME/#{profile}" ]; then
-#           source "$HOME/#{profile}"
-#         fi
-#       LINE
-#     end
-#   end
-
-#   def default_shell_sources
-#     [
-#       ".zprofile",      # zsh login shell (best for PATH setup)
-#       ".zshenv",        # zsh all shells
-#       ".bash_profile",  # bash login shell
-#       # ".bashrc",      # REMOVED: Interactive only, often has echo/prompts that break GUI launches
-#       ".profile",       # POSIX sh fallback
-#     ]
-#   end
-# end
-
 class PathInjector < AbstractEmbedder
   def initialize(app, options = {})
     super(app)
@@ -2130,163 +2039,254 @@ class PathInjector < AbstractEmbedder
     original_binary = File.join(binary_dir, "Emacs")
     real_binary = File.join(binary_dir, "Emacs.real")
 
+    # Prevent double-wrapping if run twice
     if File.exist?(real_binary)
       info "Emacs binary already wrapped, skipping PATH injection..."
       return
     end
 
-    unless File.exist?(original_binary)
-      fatal "Could not find original binary at #{original_binary}"
-    end
+    info "Injecting dynamic PATH wrapper (emacs-plus style)..."
 
-    info "Injecting native C PATH wrapper (Mach-O compatible)..."
-
-    debug "Renaming original binary to Emacs.real"
+    # 1. Rename the actual binary
+    debug "Renaming #{File.basename(original_binary)} to Emacs.real"
     FileUtils.mv(original_binary, real_binary)
 
-    arch_flags = get_arch_flags(real_binary)
-    debug "Detected architecture flags: #{arch_flags.join(' ')}"
+    # 2. Create the wrapper script
+    wrapper_content = generate_wrapper_script
 
-    wrapper_source = File.join(binary_dir, "wrapper.c")
-    File.write(wrapper_source, generate_c_wrapper_source)
+    # 3. Write the wrapper and make it executable
+    debug "Writing wrapper script to #{File.basename(original_binary)}"
+    File.write(original_binary, wrapper_content)
+    FileUtils.chmod(0755, original_binary)
 
-    debug "Compiling native wrapper..."
-    compile_cmd = [
-      "clang",
-      *arch_flags,
-      "-O2",
-      "-Wall",
-      "-o", original_binary,
-      wrapper_source
-    ]
-
-    unless system(*compile_cmd)
-      fatal "Failed to compile native wrapper. Ensure clang is installed."
-      FileUtils.mv(real_binary, original_binary) if File.exist?(real_binary)
-      FileUtils.rm(wrapper_source) if File.exist?(wrapper_source)
-      return
-    end
-
-    FileUtils.rm(wrapper_source)
-
-    info "Signing wrapper binary..."
-    system("codesign", "--force", "--deep", "--sign", "-", original_binary)
-
-    info "Native PATH wrapper installed successfully"
+    info "Dynamic PATH wrapper created successfully"
+    info "Emacs will now source shell environment on every launch"
   end
 
   private
 
-  def get_arch_flags(binary_path)
-    begin
-      file = MachO.open(binary_path)
-      archs = []
+  def generate_wrapper_script
+    <<~SCRIPT
+      #!/bin/bash
+      # Dynamic PATH wrapper for Emacs.app
+      # Sources user shell profiles to inherit PATH and other environment variables
+      # This allows Emacs to find tools installed after building, without rebuilding
 
-      if file.is_a?(MachO::FatFile)
-        archs = file.machos.map(&:cputype)
-      else
-        archs = [file.cputype]
-      end
+      # Source shell profiles silently (redirect output to prevent GUI launch issues)
+#{shell_source_lines.map { |line| "      #{line} 2>/dev/null" }.join("\n")}
 
-      flags = archs.map do |arch|
-      arch_name = arch.to_s.gsub(/^:/, '')
-      case arch_name
-      when "arm64", "16777228" then "arm64"
-      when "x86_64", "16777223" then "x86_64"
-      when "i386", "7"          then "i386"
-      else arch_name
-      end
-    end.uniq
+      # Ensure Homebrew paths are present (M1/Intel compatibility)
+      # These are prepended to avoid conflicts but still allow user overrides
+      if [ -d "/opt/homebrew/bin" ]; then
+        export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+      fi
+      if [ -d "/usr/local/bin" ]; then
+        export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+      fi
 
-      flags.flat_map { |a| ["-arch", a] }
-    rescue MachO::NotAMachOError, MachO::TruncatedFileError => e
-      fatal "Failed to parse Mach-O binary: #{e.message}"
-      exit 1
-    end
-  end
+      # Add standard system paths if not already present
+      export PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 
-  def generate_c_wrapper_source
-    shell_profile_logic = shell_source_lines
-                            .map { |l| "#{l} 2>/dev/null;" }
-                            .join(" ")
-                            .gsub('\\', '\\\\\\\\')
-                            .gsub('"', '\\"')
+      # Get the directory containing this script (fully portable)
+      DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 
-    <<~'C_CODE' % [shell_profile_logic]
-      #include <stdio.h>
-      #include <stdlib.h>
-      #include <string.h>
-      #include <unistd.h>
-      #include <limits.h>
-      #include <mach-o/dyld.h>
-
-      int main(int argc, char **argv) {
-          char exe_path[PATH_MAX];
-          uint32_t size = sizeof(exe_path);
-          if (_NSGetExecutablePath(exe_path, &size) != 0) {
-              fprintf(stderr, "Error: Buffer too small; need size %%u\n", size);
-              return 1;
-          }
-
-          char real_exe[PATH_MAX];
-          snprintf(real_exe, sizeof(real_exe), "%%s.real", exe_path);
-
-          const char *profile_logic = "%s";
-
-          const char *path_logic =
-            "if [ -d /opt/homebrew/bin ]; then export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH; fi; "
-            "if [ -d /usr/local/bin ]; then export PATH=/usr/local/bin:/usr/local/sbin:$PATH; fi; "
-            "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin";
-
-          char cmd[8192];
-          int required_len = snprintf(cmd, sizeof(cmd),
-              "%%s %%s exec '%%s' \"$@\"",
-              profile_logic, path_logic, real_exe);
-
-          if (required_len < 0 || required_len >= (int)sizeof(cmd)) {
-              fprintf(stderr, "Error: Generated shell command exceeds buffer size.\n");
-              return 1;
-          }
-
-          char **new_argv = malloc((argc + 4) * sizeof(char *));
-          if (!new_argv) {
-              perror("malloc failed");
-              return 1;
-          }
-
-          new_argv[0] = "/bin/bash";
-          new_argv[1] = "-c";
-          new_argv[2] = cmd;
-          new_argv[3] = "Emacs";
-
-          for (int i = 1; i < argc; i++) {
-              new_argv[i + 3] = argv[i];
-          }
-          new_argv[argc + 3] = NULL;
-
-          execv(new_argv[0], new_argv);
-          perror("execv failed");
-          free(new_argv);
-          return 1;
-      }
-    C_CODE
+      # Execute the real Emacs binary with all arguments
+      exec "$DIR/Emacs.real" "$@"
+    SCRIPT
   end
 
   def shell_source_lines
     @shell_sources.map do |profile|
-      "if [ -f \\\"$HOME/#{profile}\\\" ]; then source \\\"$HOME/#{profile}\\\"; fi"
+      <<~LINE.chomp
+        if [ -f "$HOME/#{profile}" ]; then
+          source "$HOME/#{profile}"
+        fi
+      LINE
     end
   end
 
   def default_shell_sources
     [
-      ".zprofile",
-      ".zshenv",
-      ".bash_profile",
-      ".profile",
+      ".zprofile",      # zsh login shell (best for PATH setup)
+      ".zshenv",        # zsh all shells
+      ".bash_profile",  # bash login shell
+      # ".bashrc",      # REMOVED: Interactive only, often has echo/prompts that break GUI launches
+      ".profile",       # POSIX sh fallback
     ]
   end
 end
+
+# class PathInjector < AbstractEmbedder
+#   def initialize(app, options = {})
+#     super(app)
+#     @inject_path = options.fetch(:inject_path, true)
+#     @shell_sources = options.fetch(:shell_sources, default_shell_sources)
+#   end
+
+#   def embed
+#     return unless @inject_path
+
+#     binary_dir = File.join(app, "Contents", "MacOS")
+#     original_binary = File.join(binary_dir, "Emacs")
+#     real_binary = File.join(binary_dir, "Emacs.real")
+
+#     if File.exist?(real_binary)
+#       info "Emacs binary already wrapped, skipping PATH injection..."
+#       return
+#     end
+
+#     unless File.exist?(original_binary)
+#       fatal "Could not find original binary at #{original_binary}"
+#     end
+
+#     info "Injecting native C PATH wrapper (Mach-O compatible)..."
+
+#     debug "Renaming original binary to Emacs.real"
+#     FileUtils.mv(original_binary, real_binary)
+
+#     arch_flags = get_arch_flags(real_binary)
+#     debug "Detected architecture flags: #{arch_flags.join(' ')}"
+
+#     wrapper_source = File.join(binary_dir, "wrapper.c")
+#     File.write(wrapper_source, generate_c_wrapper_source)
+
+#     debug "Compiling native wrapper..."
+#     compile_cmd = [
+#       "clang",
+#       *arch_flags,
+#       "-O2",
+#       "-Wall",
+#       "-o", original_binary,
+#       wrapper_source
+#     ]
+
+#     unless system(*compile_cmd)
+#       fatal "Failed to compile native wrapper. Ensure clang is installed."
+#       FileUtils.mv(real_binary, original_binary) if File.exist?(real_binary)
+#       FileUtils.rm(wrapper_source) if File.exist?(wrapper_source)
+#       return
+#     end
+
+#     FileUtils.rm(wrapper_source)
+
+#     info "Signing wrapper binary..."
+#     system("codesign", "--force", "--deep", "--sign", "-", original_binary)
+
+#     info "Native PATH wrapper installed successfully"
+#   end
+
+#   private
+
+#   def get_arch_flags(binary_path)
+#     begin
+#       file = MachO.open(binary_path)
+#       archs = []
+
+#       if file.is_a?(MachO::FatFile)
+#         archs = file.machos.map(&:cputype)
+#       else
+#         archs = [file.cputype]
+#       end
+
+#       flags = archs.map do |arch|
+#       arch_name = arch.to_s.gsub(/^:/, '')
+#       case arch_name
+#       when "arm64", "16777228" then "arm64"
+#       when "x86_64", "16777223" then "x86_64"
+#       when "i386", "7"          then "i386"
+#       else arch_name
+#       end
+#     end.uniq
+
+#       flags.flat_map { |a| ["-arch", a] }
+#     rescue MachO::NotAMachOError, MachO::TruncatedFileError => e
+#       fatal "Failed to parse Mach-O binary: #{e.message}"
+#       exit 1
+#     end
+#   end
+
+#   def generate_c_wrapper_source
+#     shell_profile_logic = shell_source_lines
+#                             .map { |l| "#{l} 2>/dev/null;" }
+#                             .join(" ")
+#                             .gsub('\\', '\\\\\\\\')
+#                             .gsub('"', '\\"')
+
+#     <<~'C_CODE' % [shell_profile_logic]
+#       #include <stdio.h>
+#       #include <stdlib.h>
+#       #include <string.h>
+#       #include <unistd.h>
+#       #include <limits.h>
+#       #include <mach-o/dyld.h>
+
+#       int main(int argc, char **argv) {
+#           char exe_path[PATH_MAX];
+#           uint32_t size = sizeof(exe_path);
+#           if (_NSGetExecutablePath(exe_path, &size) != 0) {
+#               fprintf(stderr, "Error: Buffer too small; need size %%u\n", size);
+#               return 1;
+#           }
+
+#           char real_exe[PATH_MAX];
+#           snprintf(real_exe, sizeof(real_exe), "%%s.real", exe_path);
+
+#           const char *profile_logic = "%s";
+
+#           const char *path_logic =
+#             "if [ -d /opt/homebrew/bin ]; then export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH; fi; "
+#             "if [ -d /usr/local/bin ]; then export PATH=/usr/local/bin:/usr/local/sbin:$PATH; fi; "
+#             "export PATH=$PATH:/usr/bin:/bin:/usr/sbin:/sbin";
+
+#           char cmd[8192];
+#           int required_len = snprintf(cmd, sizeof(cmd),
+#               "%%s %%s exec '%%s' \"$@\"",
+#               profile_logic, path_logic, real_exe);
+
+#           if (required_len < 0 || required_len >= (int)sizeof(cmd)) {
+#               fprintf(stderr, "Error: Generated shell command exceeds buffer size.\n");
+#               return 1;
+#           }
+
+#           char **new_argv = malloc((argc + 4) * sizeof(char *));
+#           if (!new_argv) {
+#               perror("malloc failed");
+#               return 1;
+#           }
+
+#           new_argv[0] = "/bin/bash";
+#           new_argv[1] = "-c";
+#           new_argv[2] = cmd;
+#           new_argv[3] = "Emacs";
+
+#           for (int i = 1; i < argc; i++) {
+#               new_argv[i + 3] = argv[i];
+#           }
+#           new_argv[argc + 3] = NULL;
+
+#           execv(new_argv[0], new_argv);
+#           perror("execv failed");
+#           free(new_argv);
+#           return 1;
+#       }
+#     C_CODE
+#   end
+
+#   def shell_source_lines
+#     @shell_sources.map do |profile|
+#       "if [ -f \\\"$HOME/#{profile}\\\" ]; then source \\\"$HOME/#{profile}\\\"; fi"
+#     end
+#   end
+
+#   def default_shell_sources
+#     [
+#       ".zprofile",
+#       ".zshenv",
+#       ".bash_profile",
+#       ".profile",
+#     ]
+#   end
+# end
 
 class GccInfo
   include Output
