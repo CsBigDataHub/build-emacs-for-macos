@@ -4,23 +4,23 @@
 # Lightweight wrapper reusing build-emacs-for-macos implementation
 # to build "Mac port" (jdtsmith/emacs-mac) without applying
 # NS-port specific patches. This file delegates nearly all behavior to
-# the original build-emacs-for-macos script by subclassing Build and
+# original build-emacs-for-macos script by subclassing Build and
 # overriding a few methods.
 
-# Load the main NS-port build script by exact filename (no .rb extension).
+# Load main NS-port build script by exact filename (no .rb extension).
 # Use `load` because `require_relative` appends ".rb" which does not match
-# the executable script filename used in this repo.
+# executable script filename used in this repo.
 load File.join(__dir__, "build-emacs-for-macos")
 
 class MacPortBuild < Build
   def initialize(root_dir, ref = nil, options = {})
     # Set default dist_include files (configure_output.txt and COPYING) when
-    # not provided by the caller. Merge with any existing dist_include option.
+    # not provided by caller. Merge with any existing dist_include option.
     options = (options || {}).dup
     if options[:dist_include].nil?
       options[:dist_include] = ["configure_output.txt", "COPYING"]
     else
-      # ensure the default files are present without duplication
+      # ensure default files are present without duplication
       defaults = ["configure_output.txt", "COPYING"]
       options[:dist_include] = (options[:dist_include] + defaults).uniq
     end
@@ -38,7 +38,7 @@ class MacPortBuild < Build
     @github_src_repo ||= options[:github_src_repo] || "jdtsmith/emacs-mac"
   end
 
-  # Override build_name to include "mac-port" identifier in the build name
+  # Override build_name to include "mac-port" identifier in build name
   def build_name
     return @build_name if @build_name
     return @build_name = options[:build_name] if options[:build_name]
@@ -57,14 +57,14 @@ class MacPortBuild < Build
   end
 
   # The upstream NS-port helper (macos-startup patch) should NOT be applied
-  # to the Mac port. The parent extract_tarball calls apply_macos_startup_patch;
+  # to Mac port. The parent extract_tarball calls apply_macos_startup_patch;
   # override it to no-op.
   def apply_macos_startup_patch(_target)
     info "Skipping NS-port macOS startup patch for Mac-port"
   end
 
   # Prevent applying NS-port patches. Only user-specified patches are allowed
-  # via the --patch CLI option.
+  # via --patch CLI option.
   def build_patches
     p = []
     options[:patches].each do |patch_str|
@@ -81,7 +81,7 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to handle relative paths, nested bundles, and move app.
+  # Override compile_source to use Absolute Paths and Pre-Staging (Winning Strategy).
   def compile_source(source)
     # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
@@ -109,7 +109,7 @@ class MacPortBuild < Build
         gcc_info.verify_libgccjit
       end
 
-      # Apply the compile environment
+      # Apply compile environment
       compile_env.each { |k, v| ENV[k] = v }
 
       local_lisp_path = [
@@ -120,26 +120,24 @@ class MacPortBuild < Build
         "/opt/homebrew/share/emacs/site-lisp",
       ].flatten.join(":")
 
-      # --- CLEANUP: Remove existing mac/Emacs.app to ensure fresh build ---
-      # CRITICAL: Do NOT delete the 'mac' source directory itself!
-      # It contains essential templates (Info.plist.in) and Makefiles.
-      # Only remove the app bundle created by a previous build.
-      built_app_path = File.join(source, "mac", "Emacs.app")
-      if File.exist?(built_app_path)
-        info "Cleaning up existing built app to ensure fresh build: #{built_app_path}"
-        FileUtils.rm_rf(built_app_path)
-      end
+      # --- WINNING STRATEGY STEP 1: Absolute Path ---
+      # Calculate absolute path to the final app bundle location.
+      # We use an absolute path for --enable-mac-app so make install writes
+      # directly to the output directory, avoiding the "Russian Doll" nesting
+      # issue and the "Info.plist.in" error.
+      final_app_dir = File.join(output_dir, build_name)
+      mac_app_path = File.join(final_app_dir, "Emacs.app")
 
-      # Build mac-port specific configure flags
-      # Note: mac_app_path is calculated but NOT used in configure flags.
-      # We use a relative path to ensure the build system calculates pdmp/eln paths correctly.
-      mac_app_path = File.join(output_dir, build_name)
+      # Ensure output directory exists
+      FileUtils.mkdir_p(final_app_dir)
 
       configure_flags = [
         "--with-mac",
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
-        "--enable-mac-app=mac/Emacs.app", # Use relative path for correct internal linking
+        # Use ABSOLUTE path for --enable-mac-app
+        "--enable-mac-app=#{mac_app_path}",
+        # --enable-mac-self-contained ensures portability despite absolute build paths
         "--enable-mac-self-contained",
         "--with-mac-metal",
       ]
@@ -150,11 +148,9 @@ class MacPortBuild < Build
       # Native-comp configuration
       if options[:native_comp]
         if options[:native_full_aot]
-          # This tells configure to generate Makefile with AOT rules
           configure_flags << "--with-native-compilation=aot"
           info "Configuring with --with-native-compilation=aot for full AOT"
         else
-          # Standard native-comp without AOT
           if native_comp_configure_flag
             configure_flags << native_comp_configure_flag
           else
@@ -167,8 +163,7 @@ class MacPortBuild < Build
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
-      # Ensure staging prefix so install does not write to /usr/local
-      # This handles auxiliary files; App itself is built in source/mac
+      # Ensure staging prefix
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
@@ -191,8 +186,6 @@ class MacPortBuild < Build
 
         if options[:native_full_aot]
           info "Building with AOT (configured via --with-native-compilation=aot)"
-          # DO NOT set ENV["NATIVE_FULL_AOT"] = "1" - conflicts with configure
-          # DO NOT add NATIVE_FULL_AOT=1 to make_flags - configure handles it
           ENV.delete("NATIVE_FAST_BOOT")
         else
           ENV.delete("NATIVE_FULL_AOT")
@@ -210,6 +203,47 @@ class MacPortBuild < Build
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
+      # --- WINNING STRATEGY STEP 2: Pre-Staging ---
+      # Create the target directories before make install to prevent
+      # errors or confusion in the install process.
+
+      # 1. Create native-lisp staging dir
+      frameworks_native_lisp = File.join(mac_app_path, "Contents", "Frameworks", "native-lisp")
+      begin
+        FileUtils.mkdir_p(frameworks_native_lisp)
+        info "Created staging frameworks native-lisp dir: #{frameworks_native_lisp}"
+      rescue => e
+        warn "Failed to create staging frameworks native-lisp dir: #{e.message}"
+      end
+
+      # 2. Create Resources staging dir
+      resources_dir = File.join(mac_app_path, "Contents", "Resources")
+      begin
+        FileUtils.mkdir_p(resources_dir)
+        info "Created staging Resources dir: #{resources_dir}"
+      rescue => e
+        warn "Failed to create staging Resources dir: #{e.message}"
+      end
+
+      # --- WINNING STRATEGY STEP 3: Pre-Copy Native-Lisp ---
+      # If native-lisp exists in source, copy it to output to speed up install.
+      native_lisp_src = File.join(source, "native-lisp")
+      if Dir.exist?(native_lisp_src)
+        staging_frameworks = File.join(mac_app_path, "Contents", "Frameworks")
+        begin
+          FileUtils.mkdir_p(staging_frameworks)
+          info "Copying native-lisp into staging Frameworks dir: #{staging_frameworks}"
+          # Use rsync for robust copying (if available) otherwise cp_r
+          if system("which", "rsync")
+            run_cmd("rsync", "-a", File.join(native_lisp_src, "/"), File.join(staging_frameworks, "/"))
+          else
+            FileUtils.cp_r(native_lisp_src, staging_frameworks)
+          end
+        rescue => e
+          warn "Failed to pre-copy native-lisp: #{e.message}"
+        end
+      end
+
       # Run make install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
@@ -218,140 +252,22 @@ class MacPortBuild < Build
       end
 
       # --- CLEANUP: Remove source code copied to Resources/etc ---
-      # make install sometimes copies the source directory into Resources/etc/src.
-      # This bloats the app and can cause "unsealed contents" issues.
-      src_in_resources = File.join(source, "mac", "Emacs.app", "Contents", "Resources", "etc", "src")
+      src_in_resources = File.join(mac_app_path, "Contents", "Resources", "etc", "src")
       if Dir.exist?(src_in_resources)
         info "Removing source directory from bundle Resources/etc/src..."
         FileUtils.rm_rf(src_in_resources)
       end
 
-      # --- CRITICAL FIX: Sanitize Nested Bundle ---
-      # Native-comp AOT sometimes causes make install to create a nested Emacs.app
-      # structure: Emacs.app/Contents/Emacs.app/Contents/Frameworks/native-lisp/
-      # This causes codesign to fail and breaks 'info' installation.
-
-      source_app_path = File.join(source, "mac", "Emacs.app")
-
-      if File.directory?(source_app_path)
-        # Check for invalid nested bundle
-        nested_app = File.join(source_app_path, "Contents", "Emacs.app")
-
-        if File.directory?(nested_app)
-          warn "Detected invalid nested Emacs.app bundle - fixing structure..."
-
-          # 1. Rescue native-lisp directory (Critical for native-comp)
-          nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
-          nested_native_lisp = File.join(nested_frameworks, "native-lisp")
-          target_frameworks = File.join(source_app_path, "Contents", "Frameworks")
-
-          if File.directory?(nested_native_lisp)
-            info "Rescuing native-lisp from nested bundle..."
-            FileUtils.mkdir_p(target_frameworks)
-            target_native_lisp = File.join(target_frameworks, "native-lisp")
-
-            if File.directory?(target_native_lisp)
-              info "Merging native-lisp directories..."
-              Dir.glob(File.join(nested_native_lisp, "*")).each do |file|
-                dest_file = File.join(target_native_lisp, File.basename(file))
-                FileUtils.cp_r(file, dest_file)
-              end
-            else
-              info "Moving native-lisp from nested to main bundle..."
-              FileUtils.mv(nested_native_lisp, target_frameworks)
-            end
-          end
-
-          # 2. Rescue Resources (Info, etc, src)
-          # Handle cases where make install might have written ONLY to the nested app
-          nested_resources = File.join(nested_app, "Contents", "Resources")
-          if File.directory?(nested_resources)
-            target_resources = File.join(source_app_path, "Contents", "Resources")
-            info "Checking for resources in nested bundle (info, etc, src)..."
-
-            # Ensure target resource dir exists
-            FileUtils.mkdir_p(target_resources)
-
-            Dir.glob(File.join(nested_resources, '*')).each do |item|
-              basename = File.basename(item)
-              next if basename == "." || basename == ".."
-
-              target_item = File.join(target_resources, basename)
-
-              # SPECIAL HANDLING FOR 'info':
-              # If nested 'info' is a file (corrupted), delete it. We need a directory.
-              if basename == "info"
-                if File.file?(item)
-                  warn "Found corrupted 'info' file in nested bundle. Deleting it."
-                  FileUtils.rm_f(item)
-                  next
-                end
-              end
-
-              # If item doesn't exist in main bundle, move it over.
-              # Use cp_r to handle files or directories safely.
-              unless File.exist?(target_item)
-                info "Moving #{basename} from nested to main bundle..."
-                # Use cp_r to avoid source removal errors if item is locked
-                FileUtils.cp_r(item, target_item)
-                # If cp_r succeeded, remove from nested to save space before nuking nested
-                FileUtils.rm_rf(item) if File.directory?(item)
-                FileUtils.rm_f(item) if File.file?(item)
-              end
-            end
-          end
-
-          # 3. Delete the entire invalid nested bundle
-          info "Removing nested bundle artifact..."
-          FileUtils.rm_rf(nested_app)
-
-          info "Bundle structure sanitized successfully"
-        else
-          info "No nested bundle detected - structure is correct"
-        end
-      else
-        fatal "Build failed: Expected app not found at #{source_app_path}"
-      end
-
-      # --- Move App to Output Directory ---
-      final_app_dir = File.join(output_dir, build_name)
-      final_app_path = File.join(final_app_dir, "Emacs.app")
-
-      info "Moving self-contained app from source to output directory..."
-      FileUtils.mkdir_p(final_app_dir)
-
-      # CRITICAL: Remove any existing app at destination to prevent
-      # FileUtils.mv from creating ANOTHER nested structure
-      if File.exist?(final_app_path)
-        info "Removing existing app at destination to prevent nesting..."
-        FileUtils.rm_rf(final_app_path)
-      end
-
-      info "Executing move: #{source_app_path} -> #{final_app_dir}"
-      FileUtils.mv(source_app_path, final_app_dir)
-
-      info "App successfully moved to #{final_app_path}"
+      # No "Russian Doll" cleanup needed here because we used absolute paths.
     end
 
-    # Return the produced app from the FINAL destination
+    # Return the produced app from the output directory
     alt_app = File.join(output_dir, build_name, "Emacs.app")
     if app_has_binary?(alt_app)
       info "Detected Emacs.app with binary at output directory: #{alt_app}"
       return alt_app
-    end
-
-    # Fallback checks (should not be reached if Move succeeded)
-    ns_app = File.join(source, "nextstep", "Emacs.app")
-    mac_app = File.join(source, "mac", "Emacs.app")
-
-    if app_has_binary?(ns_app)
-      warn "Found app in 'nextstep' - move may have failed"
-      return ns_app
-    elsif app_has_binary?(mac_app)
-      warn "Found app still in 'mac' source dir - move may have failed"
-      return mac_app
     else
-      fatal "Build failed. Emacs.app with binary not found after build."
+      fatal "Build failed. Emacs.app with binary not found at #{alt_app}"
     end
   end
 
@@ -363,8 +279,7 @@ class MacPortBuild < Build
     macos_dir = File.join(app_path, "Contents", "MacOS")
     return false unless File.directory?(macos_dir)
 
-    # Look for the main Emacs binary (not shell scripts or symlinks)
-    # The binary is typically named "Emacs" without extension
+    # Look for main Emacs binary (not shell scripts or symlinks)
     binary = File.join(macos_dir, "Emacs")
     return true if File.file?(binary) && !File.symlink?(binary)
 
@@ -375,9 +290,7 @@ class MacPortBuild < Build
   end
 
   # Override create_build_dir to handle cases where `make install` has already
-  # created the output build directory (common for mac-port --enable-mac-app
-  # install targets). If the target dir exists and already contains the
-  # produced Emacs.app, treat it as a successful build instead of failing.
+  # created the output build directory.
   def create_build_dir(app)
     app_name = File.basename(app)
     target_dir = File.join(output_dir, build_name)
@@ -397,6 +310,8 @@ class MacPortBuild < Build
       end
     end
 
+    # Should not be reached if compile_source worked correctly,
+    # but kept as fallback if app was prebuilt elsewhere.
     info "Copying \"#{app_name}\" to: #{target_dir}"
 
     FileUtils.mkdir_p(target_dir)
@@ -416,31 +331,17 @@ class MacPortBuild < Build
   end
 
   # Sanitize bundle subdirectory names that contain two or more dots which
-  # cause Apple's codesign to reject the bundle. Replace dots with underscores
-  # in offending directory names and apply native-lisp pdmp patching when we
-  # detect native-lisp layout patterns.
-  #
-  # IMPORTANT: We only sanitize DIRECTORIES, not files. Library files (.dylib,
-  # .so, .eln) have their install names managed by LibEmbedder and must keep
-  # their original names to match the @rpath references in binaries.
-  #
-  # For directories under libexec/ that match the darwin arch pattern
-  # (e.g., aarch64-apple-darwin25.1.0), we rename them AND create a symlink
-  # from the original name to the new name, because Emacs has these paths
-  # compiled into the binary.
+  # cause Apple's codesign to reject the bundle.
   def sanitize_bundle_dirs(app)
     return unless File.exist?(app) && File.directory?(app)
 
-    # Walk entire bundle (excluding the top-level .app itself) and rename any
-    # DIRECTORY whose basename contains two or more dots. We process the
-    # longest paths first so child entries are moved before parents.
+    # Walk entire bundle and rename any DIRECTORY with two or more dots.
     entries = Dir[File.join(app, "**", "*")]
     entries.sort_by! { |e| -e.length }
 
     entries.each do |path|
       next if path == app
-      # Only consider DIRECTORIES, not files. Files (especially .dylib) must
-      # keep their original names to match install_name references.
+      # Only consider DIRECTORIES
       next unless File.directory?(path)
 
       base = File.basename(path)
@@ -451,36 +352,31 @@ class MacPortBuild < Build
       old_name = path
       new_name = File.join(parent, new_base)
 
-      # Avoid touching the Emacs.app bundle directory itself
+      # Avoid touching the top-level .app bundle directory itself
       next if old_name.end_with?(".app") && old_name == app
 
       # Check if this is a darwin architecture directory under libexec/
-      # These paths are compiled into the Emacs binary, so we need to create
-      # a symlink from the original name to the renamed directory.
       is_libexec_arch_dir = path.include?("/libexec/") &&
                             base.match(/^(aarch64|x86_64|arm64)-apple-darwin\d+\.\d+\.\d+$/)
 
       info "Sanitizing bundle directory: #{old_name} --> #{new_name}"
 
       begin
-        # Ensure parent is writable so mv succeeds
+        # Ensure parent is writable
         begin
           File.chmod(0o775, parent) unless File.writable?(parent)
         rescue => _e
-          # ignore chmod failures, we'll try mv anyway
+          # ignore
         end
 
-        # Try a Ruby move first
         if File.exist?(new_name)
-          # If new name already exists, create a unique name by appending timestamp
           timestamp = Time.now.strftime("%s")
           new_name = "#{new_name}_#{timestamp}"
         end
 
         FileUtils.mv(old_name, new_name)
 
-        # For libexec arch directories, create a symlink from old name to new name
-        # so Emacs can find its pdmp file and helper executables
+        # For libexec arch dirs, create a symlink from old name to new name
         if is_libexec_arch_dir
           info "Creating symlink for libexec arch directory: #{base} -> #{File.basename(new_name)}"
           FileUtils.ln_s(File.basename(new_name), old_name)
@@ -499,23 +395,12 @@ class MacPortBuild < Build
         warn "Failed to rename #{old_name}: #{e.message}"
         next
       end
-
-      # If this path looks like a native-lisp path (from older logic), patch
-      # Emacs.pdmp to update any embedded native-lisp references.
-      eln_parts = old_name.match(%r{/(
-        \d+\.\d+\.\d+)/native-lisp/(\d+\.\d+\.\d+-\w+)(?:/.+)?$}ix)
-      if eln_parts
-        patch_dump_native_lisp_paths(app, eln_parts[1], eln_parts[2])
-      end
     end
   end
 
   # Override signing to sanitize problematic directory names first.
   def self_sign_app(app)
-    # Remove any pre-existing nested code signatures which can cause `codesign
-    # --force --deep` to attempt to replace invalid signatures in subcomponents
-    # before we sanitize paths. Deleting them ensures codesign performs a
-    # clean sign pass after we rename offending directories.
+    # Remove pre-existing signatures to allow a clean sign pass
     begin
       Dir[File.join(app, "**", "_CodeSignature")].each do |sigdir|
       next unless File.directory?(sigdir)
@@ -531,23 +416,6 @@ class MacPortBuild < Build
     end
 
     sanitize_bundle_dirs(app)
-
-    # Also remove any existing code signature files in nested bundles that may
-    # confuse codesign (e.g. CodeResources). This is defensive — codesign will
-    # recreate the necessary signature files.
-    begin
-      Dir[File.join(app, "**", "CodeResources")].each do |cr|
-      next unless File.file?(cr)
-      info "Removing existing CodeResources file: #{cr}"
-      begin
-        FileUtils.rm_f(cr)
-      rescue => e
-        warn "Failed to remove #{cr}: #{e.message}"
-      end
-    end
-    rescue => e
-      warn "Failed enumerating CodeResources files: #{e.message}"
-    end
 
     super(app)
   end
