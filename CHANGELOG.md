@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.6.61](https://github.com/CsBigDataHub/build-emacs-for-macos/compare/v0.6.60...v0.6.61) (2026-01-08)
+
+
+### Features
+
+* **build/options:** add --optimize and related flags ([#119](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/119)) ([8267ac1](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/8267ac166203c0c495520e6970650735702eac35))
+* **build:** add dynamic PATH injection for Emacs app launches ([12e673e](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/12e673ed7bc4512b5d165f631205d3e19ffaff71))
+* **builder/cask:** support shared helpers template ([97f77f3](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/97f77f3b1043b66da6ec737e5db91605ec961d08))
+* **builder/plan:** add build variant flag ([#137](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/137)) ([ca8b874](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/ca8b874be2c8c52cd7dcb05ff1348469e16c74ba))
+* **deps:** add support for Nix package manager ([#116](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/116)) ([6e2b9aa](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/6e2b9aa44ae1cbc3eec8ec7318ce9c9968e2d673))
+* **mac-port:** add debug logging and error tracking for build process ([505ff10](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/505ff10a8f09ac78ef5a0d3acf24f3b37e2989fd))
+* **mac-port:** hoist and symlink PDMP files in app bundle ([006d3ab](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/006d3abc1a31f76511e50023c87a2ea5091ac1e4))
+* **nix/deps:** update nixpkgs from 24.11-beta to 24.11 ([e030fee](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/e030fee6704618b7ddefea7424dff4e94f43e84d))
+* **options:** add --patch option which accepts file path or URL ([#127](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/127)) ([66ccd9c](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/66ccd9c6fd077d558eae484cdbab831486fbfd58))
+* **package:** produce and include configure output log ([#118](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/118)) ([5c513ce](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/5c513ce2e7536c57f43a49739b3f0f66d15f7b6d))
+* **patches/alpha-background:** add experimental alpha-background patch ([#129](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/129)) ([c53c398](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/c53c398cace6479a9c188e46196462791960abee)), closes [#111](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/111)
+* **path-injection:** replace C wrapper with bash script for ([ce0c5a8](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/ce0c5a87e6b9c3ececb856c2d95c8aa59abede9c))
+* **startup:** replace bundled site-start.el approach with a custom source patch ([#124](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/124)) ([03ed54c](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/03ed54ca78ce15b61f5c875f97410b3ff21ecd62))
+
+
+### Bug Fixes
+
+* **bootstrap:** add Ruby (bundle install) to make bootstrap ([bc62c89](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/bc62c890ed1aafe767286feed3eac0437ff62dc0))
+* **bootstrap:** remove --no-upgrade option from brew bundle ([2f0baba](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/2f0babae990f908d706f5f60dc4a11573918c23d))
+* **build-emacs-for-macos:** handle Mach-O architecture flags ([51854be](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/51854be4c446d171367a3560c08b238ac54a5387))
+* **build-emacs-for-macos:** improve SDK version detection with ([fd0bd49](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/fd0bd49ba6701dc7997a03bfbeaa52457a84feef))
+* **build-emacs-for-macos:** silence shell profile sourcing to ([d4b698d](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/d4b698d16a0deb5771179c421e78fa12f592dfbe))
+* **build-emacs-for-macos:** simplify C wrapper by extracting profile ([cc78a96](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/cc78a9653c107dd7bfa5a6cddb6d205687dda6eb))
+* **build-emacs-for-macos:** use Mach-O header to detect architecture ([59ce411](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/59ce411449a057f6c6c234e14d6dcbb04285097d))
+* **build/embed:** include all Emacs C sources and related files in the Emacs.app bundle ([#120](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/120)) ([ccb4f3f](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/ccb4f3f438652c7ae98c202b8afed8861f40eeec))
+* **builder/cask:** correctly resolve version with build variant to release name ([#140](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/140)) ([8ac1f94](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/8ac1f946dde2342fa82aff7f90d2126bdd1f0057))
+* **builder/cask:** ensure release info helpers return correct asset ([af0b2b8](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/af0b2b83abd5af0e61a085da386cc0da389f6588))
+* **builder/plan:** append test build name to release name ([#138](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/138)) ([e888540](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/e8885400e66bdb9304f99d9b072aa4dec4e83f4b))
+* **build:** replace bash wrapper with native C PATH wrapper ([b48ecf7](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/b48ecf7760ea71c22923369df62e78101d9b467a))
+* **compile-options:** increase runtime max open files limit ([#115](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/115)) ([ca8951c](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/ca8951ccd350ecee5ad6c637caae0af1831a9eb5)), closes [#106](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/106)
+* **deps:** work around duplicate RPATHs in libgccjit from Nix ([#134](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/134)) ([3cf1977](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/3cf1977def02d1f3732b1051bc07a923557f9edd))
+* **emacs-builder:** resolve issues with notarizing Emacs app ([#100](https://github.com/CsBigDataHub/build-emacs-for-macos/issues/100)) ([1743035](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/1743035a6d5d8c07a2c1da3f76cafe156e4ec31d))
+* **help:** correct formatting of help text output ([db72381](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/db723817bf6c0ac85da1790a1d50fbea774cc0c0))
+* **local-lisp-path:** add Apple Silicon homebrew lisp-site ([8a1ae4d](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/8a1ae4df1ca37a851f9936fcf2081536837e4c67))
+* **mac-port-build:** correct nested bundle structure and resource handling for native-comp ([d2ffaba](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/d2ffaba05582c6a99c4d9fa4b50aa002af68958d))
+* **mac-port:** add full rescue and nested bundle sanitization ([3c29930](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/3c29930bfa2af5688a432012b4245ee3bf65118b))
+* **mac-port:** add PDMP verification and copy for AOT builds, fix ([7e657cc](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/7e657cc4d8b866ed27430bd847a190290bce0629))
+* **mac-port:** avoid app nesting and build collisions by using unique build directory ([bf03d47](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/bf03d475fc3cb5dbfbe687e6ecdc3dd775ff600e))
+* **mac-port:** handle MacPort installation quirks and fix nested bundle issues ([722ab92](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/722ab925f7386a9c4da2a46994a478f99104b7f6))
+* **mac-port:** improve AOT compilation and fix nested bundle issues ([0e875b3](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/0e875b3d75cf4bfd211ef98bc6c00ebcf2683977))
+* **mac-port:** improve app build strategy with absolute paths,fallback, and safety checks ([242f86a](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/242f86aee7af53735a659bdef6ad6139be8aa042))
+* **mac-port:** move app bundle to output directory using relative ([f685a6a](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/f685a6ac26b80bdd7f940bdb9162f37d1a4305cf))
+* **mac-port:** prevent "Russian Doll" bundle issues and fix PDMP placement ([423e29a](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/423e29ab74a312dc0b2a44969c4010d6e44ecffa))
+* **mac-port:** remove redundant comments and improve PDMP hoisting ([3085f1e](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/3085f1e1194384042347531ed19101010f0e3598))
+* **mac-port:** sanitize nested bundle and clean up build artifacts ([86098cb](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/86098cb6916c76338e1240cf5e5f3894f370a646))
+* **mac-port:** simplify build strategy by using clean staging ([e34de6f](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/e34de6fb123a87836edb93dd6ab9e6ac70cc55fb))
+* **mac-port:** use absolute paths and pre-staging for robust app build ([22258f2](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/22258f209bea3c6dfc0779de45a1eac77e0d98e1))
+* **mac-port:** use relative path, hoist PDMP, and sanitize nested bundle ([b96eb72](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/b96eb72b77df54b25ec01b7bd1ef1e87a2e947a6))
+* **nix/flake:** rename flake-package-versions.txt to flake.pkgs ([d7723ee](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/d7723ee766574b6597997de7c54fb7ed7f37965c))
+* **patches:** improve chance of successful patch application by using -l ([d396165](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/d396165808ab5852566e7ff6bcc23d47ddfdfdee))
+* **patches:** tidy up patches, deprecate optional poll patch ([cfc5155](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/cfc5155199486c4e3fae7edbc7262299b3c9955c))
+* **path-injector:** implement native C wrapper for Mach-O binary ([ebc7b7b](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/ebc7b7b78613b303358f112518c6b09221757596))
+* **plan:** resolve issue loading build plan with Ruby 3.x ([a534760](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/a5347602cad16fd852386d863d88c025d703b392))
+* **shared-libs:** correctly resolve libwebp libraries ([6ee6d8c](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/6ee6d8c13ad4806b4174905dce121750ebd7aa27))
+* **signing:** add self-signing step that is enabled by default ([23a9f30](https://github.com/CsBigDataHub/build-emacs-for-macos/commit/23a9f30d45ea25fada809db757b85c175d048936))
+
 ## [0.6.60](https://github.com/jimeh/build-emacs-for-macos/compare/v0.6.59...v0.6.60) (2025-06-27)
 
 
