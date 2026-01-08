@@ -1,12 +1,5 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-
-# Lightweight wrapper reusing build-emacs-for-macos implementation
-# to build "Mac port" (jdtsmith/emacs-mac) without applying
-# NS-port specific patches. This file delegates nearly all behavior to
-# original build-emacs-for-macos script by subclassing Build and
-# overriding a few methods.
-
 load File.join(__dir__, "build-emacs-for-macos")
 
 class MacPortBuild < Build
@@ -18,10 +11,7 @@ class MacPortBuild < Build
       defaults = ["configure_output.txt", "COPYING"]
       options[:dist_include] = (options[:dist_include] + defaults).uniq
     end
-
-    # Disable rsvg by default for mac-port builds
     options[:rsvg] = false if options[:rsvg].nil?
-
     super(root_dir, ref, options)
   end
 
@@ -34,17 +24,14 @@ class MacPortBuild < Build
   def build_name
     return @build_name if @build_name
     return @build_name = options[:build_name] if options[:build_name]
-
-    metadata =
-      [
-        meta[:date]&.strftime("%Y-%m-%d"),
-        meta[:sha][0..6],
-        meta[:ref],
-        "mac-port",
-        "macOS-#{OS.sdk_version}",
-        OS.arch,
-      ].compact.map { |v| v.gsub(/[^\w_-]+/, "-") }
-
+    metadata = [
+      meta[:date]&.strftime("%Y-%m-%d"),
+      meta[:sha][0..6],
+      meta[:ref],
+      "mac-port",
+      "macOS-#{OS.sdk_version}",
+      OS.arch,
+    ].compact.map { |v| v.gsub(/[^\w_-]+/, "-") }
     @build_name = "Emacs.#{metadata.join(".")}"
   end
 
@@ -68,14 +55,12 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Helper method to hoist PDMP files from libexec to MacOS root
   def hoist_pdmp_files(app_path, location_name = "bundle")
-    return unless File.directory?(app_path)
+    return false unless File.directory?(app_path)
 
     macos_dir = File.join(app_path, "Contents", "MacOS")
-    return unless File.directory?(macos_dir)
+    return false unless File.directory?(macos_dir)
 
-    # Find all PDMP files in libexec subdirectories
     pdmp_candidates = Dir.glob(File.join(macos_dir, "libexec", "**", "*.pdmp"))
 
     if pdmp_candidates.any?
@@ -85,21 +70,18 @@ class MacPortBuild < Build
 
         if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
           info "Hoisting PDMP in #{location_name}: #{pdmp_source} -> #{pdmp_dest}"
-          # Use cp to preserve the source in case something needs it
           FileUtils.cp(pdmp_source, pdmp_dest)
         end
       end
     else
-      # Check if PDMP already exists at root level
       existing_pdmp = File.join(macos_dir, "Emacs.pdmp")
       if File.exist?(existing_pdmp)
         info "PDMP already at correct location in #{location_name}"
       else
-        warn "WARNING: No PDMP found in #{location_name} at #{macos_dir}"
+        info "No PDMP found in #{location_name} (may be added later)"
       end
     end
 
-    # Create symlink for Emacs.real.pdmp
     final_pdmp = File.join(macos_dir, "Emacs.pdmp")
     real_pdmp = File.join(macos_dir, "Emacs.real.pdmp")
 
@@ -113,9 +95,7 @@ class MacPortBuild < Build
     end
   end
 
-  # Override compile_source to build into a clean staging directory
   def compile_source(source)
-    # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
     mac_target = File.join(source, "mac")
     ns_app = File.join(ns_target, "Emacs.app")
@@ -134,7 +114,6 @@ class MacPortBuild < Build
     info "Compiling from source. This will take a while..."
 
     FileUtils.cd(source) do
-      # Set up native-comp
       if options[:native_comp]
         info "Compiling with native-comp enabled"
         verify_native_comp
@@ -156,10 +135,6 @@ class MacPortBuild < Build
         run_cmd("./autogen.sh")
       end
 
-      # --- STRATEGY: Clean Staging Directory ---
-      # We tell configure to install to 'mac/staging'.
-      # The Makefile will automatically append '/Emacs.app' to this directory.
-      # This avoids the "Emacs.app/Emacs.app" nesting issue entirely.
       staging_dir_name = "staging"
 
       configure_flags = [
@@ -190,7 +165,6 @@ class MacPortBuild < Build
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
-      # Installation prefix for aux files (not the app bundle)
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
@@ -215,7 +189,6 @@ class MacPortBuild < Build
         end
       end
 
-      # Run make
       run_cmd("make", *make_flags.compact)
 
       gnubin = "/opt/homebrew/opt/coreutils/libexec/gnubin"
@@ -224,25 +197,21 @@ class MacPortBuild < Build
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
-      # Clean staging area before install to ensure a fresh structure
       FileUtils.rm_rf(File.join(source, "mac", staging_dir_name))
 
-      # Run make install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
       unless system("sh", "-lc", sh_cmd)
         warn "make install exited with non-zero status"
       end
 
-      # Our app is now located in mac/staging/Emacs.app
       source_app_path = File.join(source, "mac", staging_dir_name, "Emacs.app")
       info "App bundle created at: #{source_app_path}"
 
-      # --- FIX: HOIST PDMP IN SOURCE LOCATION ---
-      # This cleans up the structure before we move it
-      hoist_pdmp_files(source_app_path, "source bundle")
+      if File.directory?(source_app_path)
+        hoist_pdmp_files(source_app_path, "source bundle")
+      end
 
-      # --- MOVE APP TO OUTPUT ---
       final_app_dir = File.join(output_dir, build_name)
       final_app_path = File.join(final_app_dir, "Emacs.app")
 
@@ -254,8 +223,6 @@ class MacPortBuild < Build
         FileUtils.mv(source_app_path, final_app_path)
         info "App successfully moved to #{final_app_path}"
 
-        # --- FIX: HOIST PDMP AGAIN IN FINAL LOCATION ---
-        # Ensures correctness after move and any potential renaming
         hoist_pdmp_files(final_app_path, "final bundle")
       else
         staging_root = File.join(source, "mac", staging_dir_name)
@@ -269,13 +236,23 @@ class MacPortBuild < Build
 
     alt_app = File.join(output_dir, build_name, "Emacs.app")
 
-    # Relaxed validation: Return app if directory exists, even if binary check is imperfect
-    return alt_app if File.directory?(alt_app)
+    unless app_has_binary?(alt_app)
+      fatal "Build failed: Binary not found in #{alt_app}"
+    end
 
-    fatal "Build failed. Emacs.app not found."
+    # Warn but don't fail if PDMP missing (may be hoisted later)
+    if options[:native_comp]
+      macos_dir = File.join(alt_app, "Contents", "MacOS")
+      pdmp = File.join(macos_dir, "Emacs.pdmp")
+      unless File.exist?(pdmp)
+        warn "WARNING: Native-comp enabled but PDMP not yet found at #{pdmp}"
+      end
+    end
+
+    return alt_app
   end
 
-  # Helper to check if an Emacs.app actually contains a compiled binary
+  # Pure validation - no side effects
   def app_has_binary?(app_path)
     return false unless File.exist?(app_path)
     macos_dir = File.join(app_path, "Contents", "MacOS")
@@ -326,6 +303,12 @@ class MacPortBuild < Build
   def self_sign_app(app)
     Dir[File.join(app, "**", "_CodeSignature")].each { |d| FileUtils.rm_rf(d) }
     sanitize_bundle_dirs(app)
+
+    # Final PDMP hoist after sanitization (in case dirs were renamed)
+    if options[:native_comp]
+      hoist_pdmp_files(app, "post-sanitization")
+    end
+
     super(app)
   end
 end
