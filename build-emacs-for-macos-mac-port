@@ -81,9 +81,7 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to create the App bundle Frameworks/native-lisp
-  # directory prior to `make install`. Some Makefile install steps expect the
-  # directory to exist and the staging prefix to be writable.
+  # Override compile_source to use relative paths and move the app after build.
   def compile_source(source)
     # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
@@ -123,12 +121,15 @@ class MacPortBuild < Build
       ].flatten.join(":")
 
       # Build mac-port specific configure flags
+      # Note: mac_app_path is calculated but NOT used in configure flags.
+      # We use a relative path to ensure the build system calculates pdmp/eln paths correctly.
       mac_app_path = File.join(output_dir, build_name)
+
       configure_flags = [
         "--with-mac",
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
-        "--enable-mac-app=#{mac_app_path}",
+        "--enable-mac-app=mac/Emacs.app", # Use relative path for correct internal linking
         "--enable-mac-self-contained",
         "--with-mac-metal",
       ]
@@ -136,8 +137,7 @@ class MacPortBuild < Build
       configure_flags << "--with-xwidgets" if options[:xwidgets] && supports_xwidgets?
       configure_flags << "--with-tree-sitter" if options[:tree_sitter] && supports_tree_sitter?
 
-      # CRITICAL FIX: Native-comp configuration
-      # Use configure-time flag, not make-time environment variable
+      # Native-comp configuration
       if options[:native_comp]
         if options[:native_full_aot]
           # This tells configure to generate Makefile with AOT rules
@@ -158,6 +158,7 @@ class MacPortBuild < Build
       configure_flags << "--without-dbus" if options[:dbus] == false
 
       # Ensure staging prefix so install does not write to /usr/local
+      # This handles auxiliary files; the App itself is built in source/mac
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
@@ -174,9 +175,7 @@ class MacPortBuild < Build
       make_flags = []
       make_flags += ["-j", options[:parallel].to_s] if options[:parallel]
 
-      # CRITICAL FIX: Adjust native-comp make flags
-      # Do NOT set NATIVE_FULL_AOT as environment or make variable
-      # when using --with-native-compilation=aot in configure
+      # Adjust native-comp make flags
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
 
@@ -194,29 +193,6 @@ class MacPortBuild < Build
       # Run make
       run_cmd("make", *make_flags.compact)
 
-      # Prepare install staging dirs
-      staged_app_path = File.join(output_dir, build_name, "Emacs.app")
-      frameworks_native_lisp = File.join(staged_app_path, "Contents", "Frameworks", "native-lisp")
-      begin
-        FileUtils.mkdir_p(frameworks_native_lisp)
-        info "Created staging frameworks native-lisp dir: #{frameworks_native_lisp}"
-      rescue => e
-        warn "Failed to create frameworks native-lisp dir: #{e.message}"
-      end
-
-      # Pre-copy native-lisp if present
-      native_lisp_src = File.join(source, "native-lisp")
-      if Dir.exist?(native_lisp_src)
-        staging_native_lisp = File.join(output_dir, build_name, "Emacs.app", "Contents", "Frameworks", "native-lisp")
-        begin
-          FileUtils.mkdir_p(staging_native_lisp)
-          info "Copying native-lisp into staging dir: #{staging_native_lisp}"
-          run_cmd("rsync", "-a", "#{native_lisp_src}/", "#{staging_native_lisp}/")
-        rescue => e
-          warn "Failed to pre-copy native-lisp: #{e.message}"
-        end
-      end
-
       # Add coreutils gnubin to PATH if present
       gnubin = "/opt/homebrew/opt/coreutils/libexec/gnubin"
       if Dir.exist?(gnubin)
@@ -231,117 +207,50 @@ class MacPortBuild < Build
         warn "make install exited with non-zero status"
       end
 
-      # CRITICAL FIX: Verify and copy AOT pdmp file
-      if options[:native_comp] && options[:native_full_aot]
-        info "Verifying PDMP installation for AOT build..."
+      # --- CRITICAL FIX: Move App ---
+      # Since we configured with --enable-mac-app=mac/Emacs.app (relative),
+      # the build system created a valid app at source/mac/Emacs.app.
+      # We now move this completed bundle to the final output directory.
 
-        # 1. Locate the PDMP in the Source (Build) Directory
-        build_pdmp_candidates = [
-          File.join(source, "src", "emacs.pdmp"),
-          File.join(source, "src", "Emacs.pdmp"),
-        ]
-        build_pdmp = build_pdmp_candidates.find { |f| File.exist?(f) }
-        build_pdmp ||= Dir[File.join(source, "src", "*.pdmp")].first
+      source_app_path = File.join(source, "mac", "Emacs.app")
+      final_app_dir = File.join(output_dir, build_name)
+      final_app_path = File.join(final_app_dir, "Emacs.app")
 
-        if build_pdmp.nil? || !File.exist?(build_pdmp)
-          fatal "AOT build failed: Could not find emacs.pdmp in #{File.join(source, 'src')}. " \
-                "The native-full-aot compilation did not complete successfully."
+      if File.directory?(source_app_path)
+        info "Moving self-contained app from source to output directory..."
+        FileUtils.mkdir_p(final_app_dir)
+
+        if File.exist?(final_app_path)
+          info "Removing existing app at destination..."
+          FileUtils.rm_rf(final_app_path)
         end
 
-        pdmp_size_mb = File.size(build_pdmp) / 1024.0 / 1024.0
-        info "Found AOT pdmp file: #{File.basename(build_pdmp)} (#{pdmp_size_mb.round(2)} MB)"
+        info "Executing move: #{source_app_path} -> #{final_app_dir}"
+        FileUtils.mv(source_app_path, final_app_dir)
 
-        if pdmp_size_mb < 10
-          warn "WARNING: pdmp file seems small for NATIVE_FULL_AOT (#{pdmp_size_mb.round(2)} MB). " \
-               "Expected > 10 MB. Build may be incomplete."
-        end
-
-        # 2. Locate the App Bundle
-        app_search_paths = [
-          File.join(output_dir, build_name, "Emacs.app"),
-          File.join(source, "mac", "Emacs.app"),
-          File.join(source, "nextstep", "Emacs.app"),
-        ]
-
-        app_dir = app_search_paths.find { |p| File.directory?(p) }
-
-        if app_dir.nil?
-          fatal "Could not locate Emacs.app bundle after make install"
-        end
-
-        info "Located app bundle: #{app_dir}"
-
-        # 3. Find the Emacs binary location
-        possible_binary_paths = [
-          File.join(app_dir, "Contents", "MacOS", "Emacs"),
-          File.join(app_dir, "Contents", "MacOS", "libexec", "Emacs"),
-        ]
-
-        emacs_binary = possible_binary_paths.find { |p| File.exist?(p) && File.executable?(p) }
-
-        if emacs_binary.nil?
-          fatal "Could not locate Emacs binary in app bundle"
-        end
-
-        dest_dir = File.dirname(emacs_binary)
-        dest_pdmp = File.join(dest_dir, File.basename(build_pdmp))
-
-        info "Expected pdmp location: #{dest_pdmp}"
-
-        # 4. Check if pdmp needs to be copied
-        pdmp_needs_copy = false
-
-        if !File.exist?(dest_pdmp)
-          warn "PDMP file missing in bundle"
-          pdmp_needs_copy = true
-        else
-          dest_size_mb = File.size(dest_pdmp) / 1024.0 / 1024.0
-          info "Found pdmp in bundle: #{dest_size_mb.round(2)} MB"
-
-          # Check if sizes match (allow 1% difference)
-          if (dest_size_mb - pdmp_size_mb).abs > (pdmp_size_mb * 0.01)
-            warn "Bundle pdmp size (#{dest_size_mb.round(2)} MB) differs from build (#{pdmp_size_mb.round(2)} MB)"
-            pdmp_needs_copy = true
-          end
-        end
-
-        # 5. Copy if needed
-        if pdmp_needs_copy
-          info "Copying pdmp from source to bundle..."
-          begin
-            FileUtils.cp(build_pdmp, dest_pdmp)
-            FileUtils.chmod(0o644, dest_pdmp)
-            copied_size_mb = File.size(dest_pdmp) / 1024.0 / 1024.0
-            info "Successfully copied pdmp: #{copied_size_mb.round(2)} MB"
-          rescue => e
-            fatal "Failed to copy pdmp file: #{e.message}"
-          end
-        else
-          info "PDMP file correctly installed in bundle"
-        end
-      end
-
-      # Check for app at install target
-      alt_app = File.join(output_dir, build_name, "Emacs.app")
-      if app_has_binary?(alt_app)
-        info "Detected Emacs.app with binary at install target: #{alt_app}"
-        return alt_app
-      end
-
-      # If install failed, print log
-      unless app_has_binary?(ns_app) || app_has_binary?(mac_app) || app_has_binary?(alt_app)
-        if File.exist?(install_log)
-          warn "--- #{install_log} (last 200 lines) ---"
-          IO.readlines(install_log).last(200).each { |l| warn l.chomp }
-        end
+        info "App successfully moved to #{final_app_path}"
+      else
+        fatal "Build failed: Expected app not found at #{source_app_path}"
       end
     end
 
-    # Return the produced app
+    # Return the produced app from the FINAL destination
+    alt_app = File.join(output_dir, build_name, "Emacs.app")
+    if app_has_binary?(alt_app)
+      info "Detected Emacs.app with binary at output directory: #{alt_app}"
+      return alt_app
+    end
+
+    # Fallback checks (should not be reached if Move succeeded)
+    ns_app = File.join(source, "nextstep", "Emacs.app")
+    mac_app = File.join(source, "mac", "Emacs.app")
+
     if app_has_binary?(ns_app)
-      ns_app
+      warn "Found app in 'nextstep' - move may have failed, returning source path"
+      return ns_app
     elsif app_has_binary?(mac_app)
-      mac_app
+      warn "Found app still in 'mac' source dir - move may have failed, returning source path"
+      return mac_app
     else
       fatal "Build failed. Emacs.app with binary not found after build."
     end
@@ -510,14 +419,14 @@ class MacPortBuild < Build
     # clean sign pass after we rename offending directories.
     begin
       Dir[File.join(app, "**", "_CodeSignature")].each do |sigdir|
-        next unless File.directory?(sigdir)
-        info "Removing existing code signature: #{sigdir}"
-        begin
-          FileUtils.rm_rf(sigdir)
-        rescue => e
-          warn "Failed to remove #{sigdir}: #{e.message}"
-        end
+      next unless File.directory?(sigdir)
+      info "Removing existing code signature: #{sigdir}"
+      begin
+        FileUtils.rm_rf(sigdir)
+      rescue => e
+        warn "Failed to remove #{sigdir}: #{e.message}"
       end
+    end
     rescue => e
       warn "Failed enumerating existing signatures: #{e.message}"
     end
@@ -529,14 +438,14 @@ class MacPortBuild < Build
     # recreate the necessary signature files.
     begin
       Dir[File.join(app, "**", "CodeResources")].each do |cr|
-        next unless File.file?(cr)
-        info "Removing existing CodeResources file: #{cr}"
-        begin
-          FileUtils.rm_f(cr)
-        rescue => e
-          warn "Failed to remove #{cr}: #{e.message}"
-        end
+      next unless File.file?(cr)
+      info "Removing existing CodeResources file: #{cr}"
+      begin
+        FileUtils.rm_f(cr)
+      rescue => e
+        warn "Failed to remove #{cr}: #{e.message}"
       end
+    end
     rescue => e
       warn "Failed enumerating CodeResources files: #{e.message}"
     end
