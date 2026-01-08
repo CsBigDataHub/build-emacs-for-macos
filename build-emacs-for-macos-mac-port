@@ -1,9 +1,16 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
+
+# Lightweight wrapper reusing build-emacs-for-macos implementation
+# to build "Mac port" (jdtsmith/emacs-mac).
+
 load File.join(__dir__, "build-emacs-for-macos")
 
 class MacPortBuild < Build
   def initialize(root_dir, ref = nil, options = {})
+    # Initialize the debug log
+    File.write("debug.log", "=== Build Started at #{Time.now} ===\n")
+
     options = (options || {}).dup
     if options[:dist_include].nil?
       options[:dist_include] = ["configure_output.txt", "COPYING"]
@@ -14,6 +21,26 @@ class MacPortBuild < Build
     options[:rsvg] = false if options[:rsvg].nil?
     super(root_dir, ref, options)
   end
+
+  # --- NEW DEBUG HELPER ---
+  def debug_log(message)
+    # Print to console (standard info)
+    info message
+    # Write detailed info to file
+    File.open("debug.log", "a") do |f|
+      f.puts "[#{Time.now.strftime('%H:%M:%S')}] #{message}"
+    end
+  end
+
+  def debug_cmd(command)
+    output = `#{command} 2>&1`
+    File.open("debug.log", "a") do |f|
+      f.puts ">>> EXEC: #{command}"
+      f.puts output
+      f.puts "<<< END"
+    end
+  end
+  # ------------------------
 
   private
 
@@ -36,7 +63,7 @@ class MacPortBuild < Build
   end
 
   def apply_macos_startup_patch(_target)
-    info "Skipping NS-port macOS startup patch for Mac-port"
+    debug_log "Skipping NS-port macOS startup patch for Mac-port"
   end
 
   def build_patches
@@ -56,66 +83,73 @@ class MacPortBuild < Build
   end
 
   def hoist_pdmp_files(app_path, location_name = "bundle")
-    return false unless File.directory?(app_path)
+    return unless File.directory?(app_path)
+
+    debug_log "Attempting to hoist PDMP files in #{location_name} at #{app_path}"
 
     macos_dir = File.join(app_path, "Contents", "MacOS")
-    return false unless File.directory?(macos_dir)
+    unless File.directory?(macos_dir)
+      debug_log "ERROR: MacOS directory missing in #{app_path}"
+      return
+    end
+
+    # Debug current state
+    debug_cmd("ls -R '#{macos_dir}'")
 
     pdmp_candidates = Dir.glob(File.join(macos_dir, "libexec", "**", "*.pdmp"))
-
     if pdmp_candidates.any?
       pdmp_candidates.each do |pdmp_source|
         pdmp_name = File.basename(pdmp_source)
         pdmp_dest = File.join(macos_dir, pdmp_name)
-
         if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
-          info "Hoisting PDMP in #{location_name}: #{pdmp_source} -> #{pdmp_dest}"
+          debug_log "Hoisting PDMP: #{pdmp_source} -> #{pdmp_dest}"
           FileUtils.cp(pdmp_source, pdmp_dest)
         end
       end
     else
       existing_pdmp = File.join(macos_dir, "Emacs.pdmp")
       if File.exist?(existing_pdmp)
-        info "PDMP already at correct location in #{location_name}"
+        debug_log "PDMP already at root: #{existing_pdmp}"
       else
-        info "No PDMP found in #{location_name} (may be added later)"
+        debug_log "WARNING: No PDMP found recursively in #{macos_dir}"
       end
     end
 
+    # Link Emacs.real.pdmp
     final_pdmp = File.join(macos_dir, "Emacs.pdmp")
     real_pdmp = File.join(macos_dir, "Emacs.real.pdmp")
-
     if File.exist?(final_pdmp) && !File.exist?(real_pdmp)
       begin
         FileUtils.ln_s("Emacs.pdmp", real_pdmp)
-        info "Created symlink in #{location_name}: Emacs.real.pdmp -> Emacs.pdmp"
+        debug_log "Created symlink: Emacs.real.pdmp -> Emacs.pdmp"
       rescue => e
-        warn "Failed to create PDMP symlink in #{location_name}: #{e.message}"
+        debug_log "Failed to create PDMP symlink: #{e.message}"
       end
     end
   end
 
   def compile_source(source)
+    debug_log "Entering compile_source. Source: #{source}"
+
+    # Check for cached builds
     ns_target = File.join(source, "nextstep")
     mac_target = File.join(source, "mac")
     ns_app = File.join(ns_target, "Emacs.app")
     mac_app = File.join(mac_target, "Emacs.app")
 
     if app_has_binary?(ns_app)
-      rel = ns_target.gsub("#{root_dir}/", "")
-      info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
+      debug_log "Found cached binary in nextstep"
       return ns_app
     elsif app_has_binary?(mac_app)
-      rel = mac_target.gsub("#{root_dir}/", "")
-      info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
+      debug_log "Found cached binary in mac"
       return mac_app
     end
 
-    info "Compiling from source. This will take a while..."
+    debug_log "Compiling from source..."
 
     FileUtils.cd(source) do
       if options[:native_comp]
-        info "Compiling with native-comp enabled"
+        debug_log "Native comp enabled"
         verify_native_comp
         gcc_info.verify_libgccjit
       end
@@ -131,17 +165,21 @@ class MacPortBuild < Build
       ].flatten.join(":")
 
       if File.exist?("autogen.sh")
-        info "Running autogen.sh to generate configure scripts..."
+        debug_log "Running autogen.sh"
         run_cmd("./autogen.sh")
       end
 
-      staging_dir_name = "staging"
+      # Create external absolute staging dir
+      staging_dir = File.join(root_dir, "staging_build")
+      debug_log "Preparing staging dir: #{staging_dir}"
+      FileUtils.rm_rf(staging_dir)
+      FileUtils.mkdir_p(staging_dir)
 
       configure_flags = [
         "--with-mac",
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
-        "--enable-mac-app=mac/#{staging_dir_name}",
+        "--enable-mac-app=#{staging_dir}", # Absolute external path
         "--enable-mac-self-contained",
         "--with-mac-metal",
       ]
@@ -152,27 +190,23 @@ class MacPortBuild < Build
       if options[:native_comp]
         if options[:native_full_aot]
           configure_flags << "--with-native-compilation=aot"
-          info "Configuring with --with-native-compilation=aot for full AOT"
+          debug_log "Configure: AOT enabled"
         else
-          if native_comp_configure_flag
-            configure_flags << native_comp_configure_flag
-          else
-            configure_flags << "--with-native-compilation=yes"
-          end
+          configure_flags << (native_comp_configure_flag || "--with-native-compilation=yes")
         end
       end
 
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
-      staging_prefix = File.join(output_dir, build_name, "staging")
-      FileUtils.mkdir_p(staging_prefix)
-      configure_flags << "--prefix=#{staging_prefix}"
+      aux_prefix = File.join(output_dir, build_name, "staging")
+      FileUtils.mkdir_p(aux_prefix)
+      configure_flags << "--prefix=#{aux_prefix}"
 
+      debug_log "Configure flags: #{configure_flags}"
       run_cmd("./configure", *configure_flags.compact, output_file: "configure_output.txt")
 
       if OS.sdk_version.major <= 10 && OS.sdk_version.minor <= 14
-        info "Force disabling of aligned_alloc on macOS Mojave (10.14.x) and earlier"
         disable_alligned_alloc
       end
 
@@ -189,82 +223,94 @@ class MacPortBuild < Build
         end
       end
 
+      debug_log "Running make with flags: #{make_flags}"
       run_cmd("make", *make_flags.compact)
+
+      # --- DEBUG: CHECK BINARY AFTER MAKE ---
+      unless File.exist?("src/Emacs")
+        debug_log "CRITICAL FAILURE: src/Emacs binary missing after make"
+        fatal "Make failed: src/Emacs binary does not exist."
+      end
+      debug_log "Binary built successfully at src/Emacs. Size: #{File.size('src/Emacs')}"
 
       gnubin = "/opt/homebrew/opt/coreutils/libexec/gnubin"
       if Dir.exist?(gnubin)
         ENV["PATH"] = "#{gnubin}:#{ENV["PATH"]}"
-        info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
-      FileUtils.rm_rf(File.join(source, "mac", staging_dir_name))
-
+      debug_log "Running make install..."
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
       unless system("sh", "-lc", sh_cmd)
         warn "make install exited with non-zero status"
       end
 
-      source_app_path = File.join(source, "mac", staging_dir_name, "Emacs.app")
-      info "App bundle created at: #{source_app_path}"
+      # --- DEBUG: CHECK STAGING DIR ---
+      source_app_path = File.join(staging_dir, "Emacs.app")
+      debug_log "Checking staging dir at: #{source_app_path}"
+      debug_cmd("ls -R '#{staging_dir}'")
 
-      if File.directory?(source_app_path)
-        hoist_pdmp_files(source_app_path, "source bundle")
+      unless File.directory?(source_app_path)
+        debug_log "Staging app directory not found!"
+        fatal "Build failed: App not found at #{source_app_path}"
       end
 
+      # 1. Hoist PDMP in staging
+      hoist_pdmp_files(source_app_path, "staging bundle")
+
+      # 2. Move to Output
       final_app_dir = File.join(output_dir, build_name)
       final_app_path = File.join(final_app_dir, "Emacs.app")
 
-      if File.directory?(source_app_path)
-        info "Moving app to output directory..."
-        FileUtils.mkdir_p(final_app_dir)
-        FileUtils.rm_rf(final_app_path) if File.exist?(final_app_path)
+      debug_log "Moving app from #{source_app_path} to #{final_app_dir}"
+      FileUtils.mkdir_p(final_app_dir)
+      FileUtils.rm_rf(final_app_path) if File.exist?(final_app_path)
 
-        FileUtils.mv(source_app_path, final_app_path)
-        info "App successfully moved to #{final_app_path}"
+      FileUtils.cp_r(source_app_path, final_app_dir)
 
-        hoist_pdmp_files(final_app_path, "final bundle")
+      # --- DEBUG: VERIFY COPY ---
+      debug_log "Copy finished. Checking final destination: #{final_app_path}"
+      debug_cmd("ls -R '#{final_app_path}'")
+
+      if File.directory?(final_app_path)
+        debug_log "App successfully copied."
+        FileUtils.rm_rf(staging_dir)
       else
-        staging_root = File.join(source, "mac", staging_dir_name)
-        if File.directory?(staging_root)
-          warn "Contents of staging dir #{staging_root}:"
-          warn Dir.entries(staging_root).join(", ")
-        end
-        fatal "Build failed: App not found at #{source_app_path}"
+        debug_log "CRITICAL: Copy failed. Final directory not found."
+        fatal "Failed to copy app to #{final_app_path}"
       end
-    end
 
-    alt_app = File.join(output_dir, build_name, "Emacs.app")
+      # 3. Hoist PDMP in final (double check)
+      hoist_pdmp_files(final_app_path, "final bundle")
 
-    unless app_has_binary?(alt_app)
-      fatal "Build failed: Binary not found in #{alt_app}"
-    end
-
-    # Warn but don't fail if PDMP missing (may be hoisted later)
-    if options[:native_comp]
-      macos_dir = File.join(alt_app, "Contents", "MacOS")
-      pdmp = File.join(macos_dir, "Emacs.pdmp")
-      unless File.exist?(pdmp)
-        warn "WARNING: Native-comp enabled but PDMP not yet found at #{pdmp}"
+      unless app_has_binary?(final_app_path)
+        debug_log "Validation app_has_binary? failed for #{final_app_path}"
+        fatal "Build failed: Binary missing in #{final_app_path}"
       end
-    end
 
-    return alt_app
+      debug_log "Build successful!"
+      final_app_path
+    end
   end
 
-  # Pure validation - no side effects
   def app_has_binary?(app_path)
+    debug_log "Validating binary in #{app_path}"
     return false unless File.exist?(app_path)
     macos_dir = File.join(app_path, "Contents", "MacOS")
     return false unless File.directory?(macos_dir)
 
     binary = File.join(macos_dir, "Emacs")
-    File.file?(binary) && !File.symlink?(binary)
+    has_binary = File.file?(binary) && !File.symlink?(binary)
+    debug_log "Binary exists? #{has_binary}"
+
+    has_binary
   end
 
   def create_build_dir(app)
     target_dir = File.join(output_dir, build_name)
     app_abs = File.expand_path(app)
+
+    debug_log "Creating build dir. Source: #{app}, Target: #{target_dir}"
 
     if app_abs == File.join(target_dir, "Emacs.app")
       return [target_dir, app_abs]
@@ -279,6 +325,7 @@ class MacPortBuild < Build
 
   def sanitize_bundle_dirs(app)
     return unless File.directory?(app)
+    debug_log "Sanitizing bundle dirs in #{app}"
     Dir[File.join(app, "**", "*")].sort_by { |x| -x.length }.each do |path|
       next unless File.directory?(path)
       next if path == app
@@ -301,14 +348,9 @@ class MacPortBuild < Build
   end
 
   def self_sign_app(app)
+    debug_log "Signing app: #{app}"
     Dir[File.join(app, "**", "_CodeSignature")].each { |d| FileUtils.rm_rf(d) }
     sanitize_bundle_dirs(app)
-
-    # Final PDMP hoist after sanitization (in case dirs were renamed)
-    if options[:native_comp]
-      hoist_pdmp_files(app, "post-sanitization")
-    end
-
     super(app)
   end
 end
@@ -329,6 +371,7 @@ if __FILE__ == $PROGRAM_NAME
     end
   rescue Error => e
     warn "ERROR: #{e.message}"
+    File.open("debug.log", "a") { |f| f.puts "FATAL ERROR: #{e.message}\n#{e.backtrace.join("\n")}" }
     exit 1
   end
 end
