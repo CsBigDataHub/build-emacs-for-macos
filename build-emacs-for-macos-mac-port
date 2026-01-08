@@ -81,7 +81,7 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to use Parent Directory Path and Fix AOT Flags.
+  # Override compile_source to use Parent Directory Path, AOT flags, and Full Rescue.
   def compile_source(source)
     # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
@@ -121,7 +121,7 @@ class MacPortBuild < Build
       ].flatten.join(":")
 
       # --- KEY FIX: Parent Directory Path ---
-      # mac_app_path is defined as the output parent directory.
+      # mac_app_path is defined as output parent directory.
       # We pass this to --enable-mac-app. Makefile appends Emacs.app to it.
       mac_app_path = File.join(output_dir, build_name)
       FileUtils.mkdir_p(mac_app_path)
@@ -186,9 +186,9 @@ class MacPortBuild < Build
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
 
         if options[:native_full_aot]
-          # --- FIX 2: Re-added NATIVE_FULL_AOT=1 make flag ---
-          # This make flag is required in addition to the configure flag
-          # to trigger the full AOT dump phase correctly.
+          # --- FIX 2: NATIVE_FULL_AOT=1 make flag ---
+          # This make flag is required in addition to configure flag
+          # to trigger full AOT dump phase correctly.
           info "Building with AOT (configured via --with-native-compilation=aot)"
           ENV.delete("NATIVE_FAST_BOOT")
           make_flags << "NATIVE_FULL_AOT=1"
@@ -223,78 +223,102 @@ class MacPortBuild < Build
         FileUtils.rm_rf(src_in_resources)
       end
 
-      # --- SAFETY CHECK: Sanitize Nested Bundle ---
-      # Check for invalid nested structure at install target: Output/Build/Emacs.app/Contents/Emacs.app
-      # This acts as a safety check in case build logic creates nesting.
+      # === NESTED BUNDLE SANITATION WITH FULL RESCUE ===
+      # This handles the "Russian Doll" problem where make install creates
+      # Output/Build/Emacs.app/Contents/Emacs.app. We must rescue contents from
+      # inner app to outer app before deletion.
       target_app_bundle = File.join(mac_app_path, "Emacs.app")
+      nested_app = File.join(target_app_bundle, "Contents", "Emacs.app")
 
-      if File.directory?(target_app_bundle)
-        nested_app = File.join(target_app_bundle, "Contents", "Emacs.app")
+      if File.directory?(target_app_bundle) && File.directory?(nested_app)
+        warn "Detected invalid nested Emacs.app bundle - fixing structure..."
 
-        if File.directory?(nested_app)
-          warn "Detected invalid nested Emacs.app bundle - fixing structure..."
+        # 1. Rescue Frameworks/native-lisp
+        nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
+        nested_native_lisp = File.join(nested_frameworks, "native-lisp")
+        target_frameworks = File.join(target_app_bundle, "Contents", "Frameworks")
 
-          # 1. Rescue native-lisp directory
-          nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
-          nested_native_lisp = File.join(nested_frameworks, "native-lisp")
-          target_frameworks = File.join(target_app_bundle, "Contents", "Frameworks")
-
-          if File.directory?(nested_native_lisp)
-            info "Rescuing native-lisp from nested bundle..."
-            FileUtils.mkdir_p(target_frameworks)
-            target_native_lisp = File.join(target_frameworks, "native-lisp")
-
-            if File.directory?(target_native_lisp)
-              info "Merging native-lisp directories..."
-              Dir.glob(File.join(nested_native_lisp, "*")).each do |file|
-                dest_file = File.join(target_native_lisp, File.basename(file))
-                FileUtils.cp_r(file, dest_file)
-              end
-            else
-              info "Moving native-lisp from nested to main bundle..."
-              FileUtils.mv(nested_native_lisp, target_frameworks)
-            end
+        if File.directory?(nested_native_lisp)
+          info "Rescuing native-lisp from nested bundle..."
+          FileUtils.mkdir_p(target_frameworks)
+          target_native_lisp = File.join(target_frameworks, "native-lisp")
+          if File.directory?(target_native_lisp)
+            info "Merging native-lisp directories..."
+            # Copy contents to merge
+            FileUtils.cp_r(Dir.glob("#{nested_native_lisp}/*"), target_native_lisp)
+          else
+            FileUtils.mv(nested_native_lisp, target_frameworks)
           end
-
-          # 2. Rescue orphaned resources
-          nested_resources = File.join(nested_app, "Contents", "Resources")
-          if File.directory?(nested_resources)
-            target_resources = File.join(target_app_bundle, "Contents", "Resources")
-            info "Checking for additional resources in nested bundle..."
-
-            Dir.glob(File.join(nested_resources, '*')).each do |item|
-              basename = File.basename(item)
-              next if basename == "." || basename == ".."
-
-              target_item = File.join(target_resources, basename)
-
-              # Handle corrupted 'info' file
-              if basename == "info"
-                if File.file?(item)
-                  warn "Found corrupted 'info' file in nested bundle. Deleting it."
-                  FileUtils.rm_f(item)
-                  next
-                end
-              end
-
-              unless File.exist?(target_item)
-                warn "Found orphaned resource in nested bundle: #{basename}"
-                info "Moving #{basename} to main bundle..."
-                FileUtils.cp_r(item, target_resources)
-              end
-            end
-          end
-
-          # 3. Delete entire invalid nested bundle
-          info "Removing nested bundle artifact..."
-          FileUtils.rm_rf(nested_app)
-
-          info "Bundle structure sanitized successfully"
-        else
-          info "No nested bundle detected - structure is correct"
         end
+
+        # 2. Rescue Resources
+        nested_resources = File.join(nested_app, "Contents", "Resources")
+        if File.directory?(nested_resources)
+          target_resources = File.join(target_app_bundle, "Contents", "Resources")
+          FileUtils.mkdir_p(target_resources)
+          info "Rescuing Resources from nested bundle..."
+          Dir.glob(File.join(nested_resources, '*')).each do |item|
+            basename = File.basename(item)
+            next if basename == "." || basename == ".."
+            target_item = File.join(target_resources, basename)
+            # Handle corrupted 'info' file
+            if basename == "info" && File.file?(item)
+              warn "Deleting corrupted 'info' file in nested bundle."
+              FileUtils.rm_f(item)
+              next
+            end
+            FileUtils.cp_r(item, target_resources) unless File.exist?(target_item)
+          end
+        end
+
+        # 3. Rescue MacOS directory (Critical for pdmp)
+        # Contains binary and libexec/Emacs.pdmp
+        nested_macos = File.join(nested_app, "Contents", "MacOS")
+        target_macos = File.join(target_app_bundle, "Contents", "MacOS")
+
+        if File.directory?(nested_macos)
+          info "Rescuing MacOS directory (binary + pdmp) from nested bundle..."
+          FileUtils.mkdir_p(target_macos)
+
+          Dir.glob(File.join(nested_macos, "*")).each do |item|
+            basename = File.basename(item)
+            target_item = File.join(target_macos, basename)
+
+            # Polished: Move files, Copy directories (safer merge)
+            if File.directory?(item) && File.directory?(target_item)
+              info "Merging #{basename} directory..."
+              FileUtils.cp_r("#{item}/.", target_item)
+            else
+              FileUtils.mv(item, target_macos) unless File.exist?(target_item)
+            end
+          end
+        end
+
+        # 4. Verify pdmp was rescued
+        pdmp_pattern = File.join(target_macos, "libexec", "*", "Emacs.pdmp")
+        rescued_pdmps = Dir.glob(pdmp_pattern)
+        if rescued_pdmps.any?
+          info "Verified pdmp rescued: #{rescued_pdmps.first}"
+        else
+          warn "WARNING: No Emacs.pdmp found after MacOS rescue - dump mode may fall back to source"
+        end
+
+        # 5. Remove nested artifact
+        info "Removing nested bundle artifact..."
+        FileUtils.rm_rf(nested_app)
+        info "Bundle structure sanitized successfully"
       else
+        info "No nested bundle detected - structure is correct"
+      end
+
+      # === FINAL VERIFICATION ===
+      # Ensure the app bundle is valid after sanitization
+      unless File.directory?(target_app_bundle)
         fatal "Build failed: Expected app not found at #{target_app_bundle}"
+      end
+
+      unless app_has_binary?(target_app_bundle)
+        fatal "Build failed: App binary not found after sanitization at #{target_app_bundle}"
       end
     end
 
@@ -318,9 +342,7 @@ class MacPortBuild < Build
     binary = File.join(macos_dir, "Emacs")
     return true if File.file?(binary) && !File.symlink?(binary)
 
-    Dir[File.join(macos_dir, "Emacs-*")].any? do |p|
-      File.file?(p) && !File.symlink?(p)
-    end
+    Dir[File.join(macos_dir, "Emacs-*")].any? { |p| File.file?(p) && !File.symlink?(p) }
   end
 
   # Override create_build_dir to handle cases where `make install` has already
@@ -334,7 +356,7 @@ class MacPortBuild < Build
     if File.exist?(target_dir)
       info "Output directory #{target_dir} already exists."
 
-      # If the produced app already lives inside the expected target directory,
+      # If produced app already lives inside expected target directory,
       # use it rather than attempting to copy into an existing directory.
       if app_abs.start_with?(target_dir_abs + "/") || app_abs == File.join(target_dir_abs, app_name)
         info "Using existing Emacs.app in #{target_dir} as build output"
@@ -391,7 +413,7 @@ class MacPortBuild < Build
       begin
         begin
           File.chmod(0o775, parent) unless File.writable?(parent)
-        rescue => _e
+        rescue
         end
 
         if File.exist?(new_name)
@@ -401,6 +423,7 @@ class MacPortBuild < Build
 
         FileUtils.mv(old_name, new_name)
 
+        # For libexec arch directories, create a symlink from old name to new name
         if is_libexec_arch_dir
           info "Creating symlink for libexec arch directory: #{base} -> #{File.basename(new_name)}"
           FileUtils.ln_s(File.basename(new_name), old_name)
@@ -409,9 +432,7 @@ class MacPortBuild < Build
         warn "Permission error renaming #{old_name}, attempting sudo: #{e.message}"
         begin
           run_cmd("sudo", "mv", old_name, new_name)
-          if is_libexec_arch_dir
-            run_cmd("sudo", "ln", "-s", File.basename(new_name), old_name)
-          end
+          run_cmd("sudo", "ln", "-s", File.basename(new_name), old_name) if is_libexec_arch_dir
         rescue Error => ee
           fatal "Failed to rename #{old_name} to #{new_name}: #{ee.message}"
         end
@@ -423,6 +444,7 @@ class MacPortBuild < Build
   end
 
   def self_sign_app(app)
+    # Remove any pre-existing nested code signatures
     begin
       Dir[File.join(app, "**", "_CodeSignature")].each do |sigdir|
       next unless File.directory?(sigdir)
@@ -439,6 +461,7 @@ class MacPortBuild < Build
 
     sanitize_bundle_dirs(app)
 
+    # Remove pre-existing code signature files
     begin
       Dir[File.join(app, "**", "CodeResources")].each do |cr|
       next unless File.file?(cr)
@@ -472,7 +495,6 @@ if __FILE__ == $PROGRAM_NAME
       build.print_preview
     elsif cli_options[:clean_macho_binary]
       macho_cleaner = MachOCleaner.new(cli_options[:clean_macho_binary])
-
       if macho_cleaner.duplicate_rpaths?
         build.info "Removing duplicate RPATHs from " \
                    "#{cli_options[:clean_macho_binary]}..."
