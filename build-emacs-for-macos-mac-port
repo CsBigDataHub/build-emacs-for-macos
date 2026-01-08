@@ -3,24 +3,16 @@
 
 # Lightweight wrapper reusing build-emacs-for-macos implementation
 # to build "Mac port" (jdtsmith/emacs-mac) without applying
-# NS-port specific patches. This file delegates nearly all behavior to
-# original build-emacs-for-macos script by subclassing Build and
-# overriding a few methods.
+# NS-port specific patches.
 
-# Load main NS-port build script by exact filename (no .rb extension).
-# Use `load` because `require_relative` appends ".rb" which does not match
-# executable script filename used in this repo.
 load File.join(__dir__, "build-emacs-for-macos")
 
 class MacPortBuild < Build
   def initialize(root_dir, ref = nil, options = {})
-    # Set default dist_include files (configure_output.txt and COPYING) when
-    # not provided by caller. Merge with any existing dist_include option.
     options = (options || {}).dup
     if options[:dist_include].nil?
       options[:dist_include] = ["configure_output.txt", "COPYING"]
     else
-      # ensure default files are present without duplication
       defaults = ["configure_output.txt", "COPYING"]
       options[:dist_include] = (options[:dist_include] + defaults).uniq
     end
@@ -33,12 +25,10 @@ class MacPortBuild < Build
 
   private
 
-  # Use jdtsmith/emacs-mac by default unless overridden via --github-src-repo
   def github_src_repo
     @github_src_repo ||= options[:github_src_repo] || "jdtsmith/emacs-mac"
   end
 
-  # Override build_name to include "mac-port" identifier in build name
   def build_name
     return @build_name if @build_name
     return @build_name = options[:build_name] if options[:build_name]
@@ -56,15 +46,10 @@ class MacPortBuild < Build
     @build_name = "Emacs.#{metadata.join(".")}"
   end
 
-  # The upstream NS-port helper (macos-startup patch) should NOT be applied
-  # to Mac port. The parent extract_tarball calls apply_macos_startup_patch;
-  # override it to no-op.
   def apply_macos_startup_patch(_target)
     info "Skipping NS-port macOS startup patch for Mac-port"
   end
 
-  # Prevent applying NS-port patches. Only user-specified patches are allowed
-  # via --patch CLI option.
   def build_patches
     p = []
     options[:patches].each do |patch_str|
@@ -81,14 +66,14 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to use Absolute Paths, AOT flags, and Fallback mechanism.
+  # Override compile_source to build into a clean staging directory
   def compile_source(source)
-    # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
     mac_target = File.join(source, "mac")
     ns_app = File.join(ns_target, "Emacs.app")
     mac_app = File.join(mac_target, "Emacs.app")
 
+    # Early check for cached builds
     if app_has_binary?(ns_app)
       rel = ns_target.gsub("#{root_dir}/", "")
       info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
@@ -102,14 +87,12 @@ class MacPortBuild < Build
     info "Compiling from source. This will take a while..."
 
     FileUtils.cd(source) do
-      # Set up native-comp if requested
       if options[:native_comp]
         info "Compiling with native-comp enabled"
         verify_native_comp
         gcc_info.verify_libgccjit
       end
 
-      # Apply compile environment
       compile_env.each { |k, v| ENV[k] = v }
 
       local_lisp_path = [
@@ -125,27 +108,17 @@ class MacPortBuild < Build
         run_cmd("./autogen.sh")
       end
 
-      # --- STRATEGY: Absolute Path with Fallback ---
-      # We tell configure to install to the final output directory.
-      # Most versions of emacs-mac handle this correctly.
-      # However, if the Makefile ignores it and builds locally (e.g. in source/mac),
-      # we implement a fallback to move the app from source to output.
-
-      staging_dir_name = "staging-build"
-      final_app_dir = File.join(output_dir, build_name)
-      final_app_path = File.join(final_app_dir, "Emacs.app")
-
-      FileUtils.mkdir_p(final_app_dir)
-
-      # --- REFINEMENT 4: Diagnostic Logging ---
-      info "Configuring to install app at absolute path: #{final_app_path}"
+      # --- STRATEGY: Clean Staging Directory ---
+      # We tell configure to install to 'mac/staging'.
+      # The Makefile will automatically append '/Emacs.app' to this directory.
+      # This avoids the "Emacs.app/Emacs.app" nesting issue entirely.
+      staging_dir_name = "staging"
 
       configure_flags = [
         "--with-mac",
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
-        # Pass ABSOLUTE path to final app location
-        "--enable-mac-app=#{final_app_dir}",
+        "--enable-mac-app=mac/#{staging_dir_name}",
         "--enable-mac-self-contained",
         "--with-mac-metal",
       ]
@@ -153,7 +126,6 @@ class MacPortBuild < Build
       configure_flags << "--with-xwidgets" if options[:xwidgets] && supports_xwidgets?
       configure_flags << "--with-tree-sitter" if options[:tree_sitter] && supports_tree_sitter?
 
-      # Native-comp configuration
       if options[:native_comp]
         if options[:native_full_aot]
           configure_flags << "--with-native-compilation=aot"
@@ -170,12 +142,10 @@ class MacPortBuild < Build
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
-      # Installation prefix for aux files
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
 
-      # Run configure
       run_cmd("./configure", *configure_flags.compact, output_file: "configure_output.txt")
 
       if OS.sdk_version.major <= 10 && OS.sdk_version.minor <= 14
@@ -188,11 +158,8 @@ class MacPortBuild < Build
 
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
-
         if options[:native_full_aot]
-          info "Building with AOT (configured via --with-native-compilation=aot)"
           ENV.delete("NATIVE_FAST_BOOT")
-          make_flags << "NATIVE_FULL_AOT=1"
         else
           ENV.delete("NATIVE_FULL_AOT")
           ENV["NATIVE_FAST_BOOT"] = "1"
@@ -208,6 +175,9 @@ class MacPortBuild < Build
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
+      # Clean staging area before install to ensure a fresh structure
+      FileUtils.rm_rf(File.join(source, "mac", staging_dir_name))
+
       # Run make install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
@@ -215,144 +185,115 @@ class MacPortBuild < Build
         warn "make install exited with non-zero status"
       end
 
-      # --- REFINEMENT 5: Fallback Check ---
-      # Check if make install placed the app at the absolute path.
-      # If Makefile ignored the absolute path and built locally,
-      # we must move the app from the source directory.
-      unless File.directory?(final_app_path)
-        info "App not found at target (absolute path). Checking source directory fallback..."
+      # Our app is now located in mac/staging/Emacs.app
+      source_app_path = File.join(source, "mac", staging_dir_name, "Emacs.app")
 
-        # Possible local paths Makefile might have used
-        # We look for staging-build/Emacs.app or the default mac/Emacs.app
-        source_stage_path = File.join(source, "mac", staging_dir_name, "Emacs.app")
-        source_default_path = File.join(source, "mac", "Emacs.app")
-
-        found_source_app = if File.directory?(source_stage_path)
-                             source_stage_path
-                           elsif File.directory?(source_default_path)
-                             source_default_path
-                           end
-
-        if found_source_app
-          info "Found app in source directory: #{found_source_app}"
-          info "Moving app to final output directory..."
-          # Ensure target dir exists (it should, but just in case)
-          FileUtils.mkdir_p(final_app_dir)
-          FileUtils.mv(found_source_app, final_app_path)
+      # Diagnostic: Confirm existence
+      unless File.directory?(source_app_path)
+        # Fallback check (rare case where Makefile ignored suffix)
+        alt_path = File.join(source, "mac", "Emacs.app")
+        if File.directory?(alt_path)
+          warn "App found in default location, not staging. Using it."
+          source_app_path = alt_path
         else
-          fatal "Build failed. Emacs.app not found at target #{final_app_path} or in source directory."
+          fatal "Build failed: App not found at #{source_app_path}"
         end
       end
 
-      # --- CLEANUP: Remove source code ---
-      # Since we moved the app (or it was installed directly), clean up src.
-      src_in_resources = File.join(final_app_path, "Contents", "Resources", "etc", "src")
-      if Dir.exist?(src_in_resources)
-        info "Removing source directory from bundle Resources/etc/src..."
-        FileUtils.rm_rf(src_in_resources)
-      end
+      # === SANITIZATION PHASE (Unconditional) ===
 
-      # --- SAFETY CHECK: Sanitize Nested Bundle ---
-      # This handles unexpected Russian Doll issues if they occurred during move
-      target_app_bundle = final_app_path
-      nested_app = File.join(target_app_bundle, "Contents", "Emacs.app")
+      # 1. FIX ROOT NESTING (Emacs.app/Emacs.app)
+      # Even with staging, we check this just to be safe.
+      nested_root_app = File.join(source_app_path, "Emacs.app")
+      if File.directory?(nested_root_app)
+        warn "Detected nested Emacs.app at ROOT. Promoting inner app..."
 
-      if File.directory?(target_app_bundle) && File.directory?(nested_app)
-        warn "Detected invalid nested Emacs.app bundle - fixing structure..."
+        # Staging temp path
+        temp_staging = File.join(source, "mac", "Emacs_temp_staging.app")
+        FileUtils.mv(nested_root_app, temp_staging)
 
-        # 1. Rescue Frameworks/native-lisp
-        nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
-        nested_native_lisp = File.join(nested_frameworks, "native-lisp")
-        target_frameworks = File.join(target_app_bundle, "Contents", "Frameworks")
-
-        if File.directory?(nested_native_lisp)
-          info "Rescuing native-lisp from nested bundle..."
-          FileUtils.mkdir_p(target_frameworks)
-          target_native_lisp = File.join(target_frameworks, "native-lisp")
-          if File.directory?(target_native_lisp)
-            info "Merging native-lisp directories..."
-            FileUtils.cp_r(Dir.glob("#{nested_native_lisp}/*"), target_native_lisp)
-          else
-            FileUtils.mv(nested_native_lisp, target_frameworks)
-          end
-        end
-
-        # 2. Rescue Resources
-        nested_resources = File.join(nested_app, "Contents", "Resources")
-        if File.directory?(nested_resources)
-          target_resources = File.join(target_app_bundle, "Contents", "Resources")
-          FileUtils.mkdir_p(target_resources)
-          info "Rescuing Resources from nested bundle..."
-          Dir.glob(File.join(nested_resources, '*')).each do |item|
-            basename = File.basename(item)
-            next if basename == "." || basename == ".."
-            target_item = File.join(target_resources, basename)
-            if basename == "info" && File.file?(item)
-              warn "Deleting corrupted 'info' file in nested bundle."
-              FileUtils.rm_f(item)
-              next
-            end
-            FileUtils.cp_r(item, target_resources) unless File.exist?(target_item)
-          end
-        end
-
-        # 3. Rescue MacOS (pdmp)
-        nested_macos = File.join(nested_app, "Contents", "MacOS")
-        target_macos = File.join(target_app_bundle, "Contents", "MacOS")
-        if File.directory?(nested_macos)
-          info "Rescuing MacOS directory (binary + pdmp) from nested bundle..."
-          FileUtils.mkdir_p(target_macos)
-          Dir.glob(File.join(nested_macos, "*")).each do |item|
-            basename = File.basename(item)
-            target_item = File.join(target_macos, basename)
-            if File.directory?(item) && File.directory?(target_item)
-              info "Merging #{basename} directory..."
-              FileUtils.cp_r("#{item}/.", target_item)
-            else
-              FileUtils.mv(item, target_macos) unless File.exist?(target_item)
+        # Helper to rescue directories (Resources/Frameworks/MacOS) from Outer to Inner
+        rescue_dir = lambda do |subpath|
+          outer_dir = File.join(source_app_path, subpath)
+          inner_dir = File.join(temp_staging, subpath)
+          if File.directory?(outer_dir)
+            FileUtils.mkdir_p(inner_dir)
+            Dir.glob(File.join(outer_dir, "*")).each do |item|
+              basename = File.basename(item)
+              target_item = File.join(inner_dir, basename)
+              unless File.exist?(target_item)
+                info "Rescuing #{subpath}/#{basename} from outer bundle"
+                FileUtils.cp_r(item, inner_dir)
+              end
             end
           end
         end
 
-        # 4. Verify pdmp
-        # --- REFINEMENT 2: Recursive PDMP search ---
-        pdmp_pattern = File.join(target_macos, "**", "*.pdmp")
-        rescued_pdmps = Dir.glob(pdmp_pattern)
-        if rescued_pdmps.any?
-          info "Verified pdmp rescued: #{rescued_pdmps.first}"
-        else
-          warn "WARNING: No Emacs.pdmp found after MacOS rescue"
+        rescue_dir.call("Contents/Frameworks")
+        rescue_dir.call("Contents/Resources")
+        rescue_dir.call("Contents/MacOS")
+
+        # Nuke outer
+        FileUtils.rm_rf(source_app_path)
+        # Move inner back
+        FileUtils.mv(temp_staging, source_app_path)
+        info "Root nesting fixed. Inner app promoted."
+      end
+
+      # 2. FIX PDMP LOCATION
+      # Unconditionally look for Emacs.pdmp in libexec and hoist it.
+      if File.directory?(source_app_path)
+        macos_dir = File.join(source_app_path, "Contents", "MacOS")
+        pdmp_files = Dir[File.join(macos_dir, "**", "*.pdmp")]
+
+        pdmp_files.each do |pdmp_source|
+          pdmp_name = File.basename(pdmp_source)
+          pdmp_dest = File.join(macos_dir, pdmp_name)
+
+          if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
+            info "Hoisting PDMP file: #{pdmp_source} -> #{pdmp_dest}"
+            FileUtils.cp(pdmp_source, pdmp_dest)
+          end
         end
 
-        # 5. Remove nested artifact
-        info "Removing nested bundle artifact..."
-        FileUtils.rm_rf(nested_app)
-        info "Bundle structure sanitized successfully"
+        # Verify and Link
+        final_pdmp = File.join(macos_dir, "Emacs.pdmp")
+        real_pdmp = File.join(macos_dir, "Emacs.real.pdmp")
+
+        if File.exist?(final_pdmp)
+          info "PDMP successfully placed at #{final_pdmp}"
+          unless File.exist?(real_pdmp)
+            info "Creating symlink for Emacs.real.pdmp..."
+            FileUtils.ln_s("Emacs.pdmp", real_pdmp)
+          end
+        else
+          warn "WARNING: No Emacs.pdmp found in #{macos_dir} — dumped mode will fail"
+        end
+      end
+
+      # --- MOVE APP TO OUTPUT ---
+      final_app_dir = File.join(output_dir, build_name)
+      final_app_path = File.join(final_app_dir, "Emacs.app")
+
+      if File.directory?(source_app_path)
+        info "Moving app to output directory..."
+        FileUtils.mkdir_p(final_app_dir)
+        FileUtils.rm_rf(final_app_path) if File.exist?(final_app_path)
+
+        FileUtils.mv(source_app_path, final_app_path)
+        info "App successfully moved to #{final_app_path}"
       else
-        info "No nested bundle detected - structure is correct"
-      end
-
-      # --- FINAL VERIFICATION ---
-      unless File.directory?(final_app_path)
-        fatal "Build failed: App not found at #{final_app_path}"
-      end
-      unless app_has_binary?(final_app_path)
-        fatal "Build failed: App binary not valid at #{final_app_path}"
+        fatal "Build failed: App not found at #{source_app_path}"
       end
     end
 
-    # Return app path
     alt_app = File.join(output_dir, build_name, "Emacs.app")
-    if app_has_binary?(alt_app)
-      info "Detected Emacs.app with binary at output directory: #{alt_app}"
-      return alt_app
-    else
-      fatal "Build failed. Emacs.app with binary not found at #{alt_app}"
-    end
+    return alt_app if app_has_binary?(alt_app)
+
+    fatal "Build failed. Emacs.app not found."
   end
 
-  # --- REFINEMENT 3: Improved validation ---
-  # Checks for versioned binaries (Emacs-30.x) and recursively checks for pdmp
+  # Refined validation based on user feedback
   def app_has_binary?(app_path)
     return false unless File.exist?(app_path)
 
@@ -361,147 +302,63 @@ class MacPortBuild < Build
 
     # Check for main binary (Emacs)
     binary = File.join(macos_dir, "Emacs")
-    has_main = File.file?(binary) && !File.symlink?(binary)
+    has_binary = File.file?(binary) && !File.symlink?(binary)
 
-    # Check for versioned binary (e.g. Emacs-30.0.92)
-    has_versioned = Dir[File.join(macos_dir, "Emacs-*")].any? { |p| File.file?(p) && !File.symlink?(p) }
-
-    # Refinement 3: Validate PDMP recursively
-    has_pdmp = false
-    if options[:native_comp] || options[:native_full_aot]
-      # ** REFINEMENT 2: Recursive search **
-      has_pdmp = !Dir[File.join(macos_dir, "**", "*.pdmp")].empty?
+    # Check for versioned binary if main not found
+    unless has_binary
+      has_binary = Dir[File.join(macos_dir, "Emacs-*")].any? { |p| File.file?(p) && !File.symlink?(p) }
     end
 
-    (has_main || has_versioned) && has_pdmp
+    # Check for PDMP if native compilation is enabled
+    if options[:native_comp]
+      has_pdmp = File.exist?(File.join(macos_dir, "Emacs.pdmp"))
+      return has_binary && has_pdmp
+    end
+
+    has_binary
   end
 
   def create_build_dir(app)
     target_dir = File.join(output_dir, build_name)
-    target_dir_abs = File.expand_path(target_dir)
     app_abs = File.expand_path(app)
 
-    if File.exist?(target_dir)
-      info "Output directory #{target_dir} already exists."
-      if app_abs == File.join(target_dir_abs, "Emacs.app")
-        info "Using existing Emacs.app in #{target_dir} as build output"
-        return [target_dir, app_abs]
-      else
-        fatal "Output directory #{target_dir} already exists, please delete it and try again"
-      end
+    if app_abs == File.join(target_dir, "Emacs.app")
+      return [target_dir, app_abs]
     end
 
-    info "Copying \"#{File.basename(app)}\" to: #{target_dir}"
-
+    info "Copying app to #{target_dir}"
     FileUtils.mkdir_p(target_dir)
+    FileUtils.rm_rf(File.join(target_dir, "Emacs.app"))
     cmd("cp", "-a", app, target_dir)
-
-    options[:dist_include]&.each do |filename|
-      src = File.join(source_dir, filename)
-      if File.exist?(src)
-        info "Copying \"#{filename}\" to: #{target_dir}"
-        cmd("cp", "-pRL", src, target_dir)
-      else
-        info "Warning: #{filename} does not exist in #{source_dir}"
-      end
-    end
-
     [target_dir, File.join(target_dir, File.basename(app))]
   end
 
-  # --- REFINEMENT 2 & SANITIZE LOGIC ---
   def sanitize_bundle_dirs(app)
     return unless File.directory?(app)
-
-    entries = Dir[File.join(app, "**", "*")]
-    entries.sort_by! { |e| -e.length }
-
-    entries.each do |path|
-      next if path == app
+    Dir[File.join(app, "**", "*")].sort_by { |x| -x.length }.each do |path|
       next unless File.directory?(path)
-
+      next if path == app
       base = File.basename(path)
-      next unless base.match(/\..+\./)
+      next unless base.include?(".")
+      next if base.end_with?(".app")
 
       parent = File.dirname(path)
-      new_base = base.gsub(".", "_")
-      old_name = path
-      new_name = File.join(parent, new_base)
-
-      next if old_name.end_with?(".app") && old_name == app
-
-      is_libexec_arch_dir = path.include?("/libexec/") &&
-                            base.match(/^(aarch64|x86_64|arm64)-apple-darwin\d+\.\d+\.\d+$/)
-
-      info "Sanitizing bundle directory: #{old_name} --> #{new_name}"
+      new_path = File.join(parent, base.gsub(".", "_"))
 
       begin
-        begin
-          File.chmod(0o775, parent) unless File.writable?(parent)
-        rescue
-        end
-
-        if File.exist?(new_name)
-          timestamp = Time.now.strftime("%s")
-          new_name = "#{new_name}_#{timestamp}"
-        end
-
-        FileUtils.mv(old_name, new_name)
-
-        if is_libexec_arch_dir
-          info "Creating symlink for libexec arch directory: #{base} -> #{File.basename(new_name)}"
-          FileUtils.ln_s(File.basename(new_name), old_name)
-        end
-      rescue Errno::EACCES, Errno::EPERM => e
-        warn "Permission error renaming #{old_name}, attempting sudo: #{e.message}"
-        begin
-          run_cmd("sudo", "mv", old_name, new_name)
-          if is_libexec_arch_dir
-            run_cmd("sudo", "ln", "-s", File.basename(new_name), old_name)
-          end
-        rescue Error => ee
-          fatal "Failed to rename #{old_name} to #{new_name}: #{ee.message}"
+        FileUtils.mv(path, new_path)
+        if path.include?("/libexec/") && base.match?(/apple-darwin/)
+          FileUtils.ln_s(File.basename(new_path), path)
         end
       rescue => e
-        warn "Failed to rename #{old_name}: #{e.message}"
-        next
+        warn "Failed to sanitize #{path}: #{e.message}"
       end
     end
   end
 
   def self_sign_app(app)
-    # Remove any pre-existing nested code signatures
-    begin
-      Dir[File.join(app, "**", "_CodeSignature")].each do |sigdir|
-      next unless File.directory?(sigdir)
-      info "Removing existing code signature: #{sigdir}"
-      begin
-        FileUtils.rm_rf(sigdir)
-      rescue => e
-        warn "Failed to remove #{sigdir}: #{e.message}"
-      end
-    end
-    rescue => e
-      warn "Failed enumerating existing signatures: #{e.message}"
-    end
-
+    Dir[File.join(app, "**", "_CodeSignature")].each { |d| FileUtils.rm_rf(d) }
     sanitize_bundle_dirs(app)
-
-    # Remove pre-existing code signature files
-    begin
-      Dir[File.join(app, "**", "CodeResources")].each do |cr|
-      next unless File.file?(cr)
-      info "Removing existing CodeResources file: #{cr}"
-      begin
-        FileUtils.rm_f(cr)
-      rescue => e
-        warn "Failed to remove #{cr}: #{e.message}"
-      end
-    end
-    rescue => e
-      warn "Failed enumerating CodeResources files: #{e.message}"
-    end
-
     super(app)
   end
 end
@@ -509,10 +366,8 @@ end
 if __FILE__ == $PROGRAM_NAME
   begin
     cli_options = CLIOptions.parse(ARGV)
-
     Output.log_level = cli_options.delete(:log_level)
     work_dir = cli_options.delete(:work_dir)
-
     build = MacPortBuild.new(work_dir, ARGV.shift, cli_options)
 
     if cli_options[:info]
