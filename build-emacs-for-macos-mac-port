@@ -81,8 +81,7 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to pass Parent Directory to --enable-mac-app.
-  # This fixes the "Russian Doll" nesting issue where Makefile appends Emacs.app.
+  # Override compile_source to use Parent Directory Path and Fix AOT Flags.
   def compile_source(source)
     # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
@@ -122,10 +121,17 @@ class MacPortBuild < Build
       ].flatten.join(":")
 
       # --- KEY FIX: Parent Directory Path ---
-      # mac_app_path is defined as the output directory (parent).
+      # mac_app_path is defined as the output parent directory.
       # We pass this to --enable-mac-app. Makefile appends Emacs.app to it.
       mac_app_path = File.join(output_dir, build_name)
       FileUtils.mkdir_p(mac_app_path)
+
+      # --- FIX 1: Run autogen.sh ---
+      # Required for emacs-mac to generate configure scripts if they don't exist
+      if File.exist?("autogen.sh")
+        info "Running autogen.sh to generate configure scripts..."
+        run_cmd("./autogen.sh")
+      end
 
       configure_flags = [
         "--with-mac",
@@ -175,12 +181,17 @@ class MacPortBuild < Build
       make_flags = []
       make_flags += ["-j", options[:parallel].to_s] if options[:parallel]
 
+      # Adjust native-comp make flags
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
 
         if options[:native_full_aot]
+          # --- FIX 2: Re-added NATIVE_FULL_AOT=1 make flag ---
+          # This make flag is required in addition to the configure flag
+          # to trigger the full AOT dump phase correctly.
           info "Building with AOT (configured via --with-native-compilation=aot)"
           ENV.delete("NATIVE_FAST_BOOT")
+          make_flags << "NATIVE_FULL_AOT=1"
         else
           ENV.delete("NATIVE_FULL_AOT")
           ENV["NATIVE_FAST_BOOT"] = "1"
@@ -197,42 +208,6 @@ class MacPortBuild < Build
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
-      # --- Pre-Staging ---
-      # Create directories inside the bundle BEFORE make install runs.
-      # We construct path: Parent/Emacs.app/Contents/...
-      frameworks_native_lisp = File.join(mac_app_path, "Emacs.app", "Contents", "Frameworks", "native-lisp")
-      begin
-        FileUtils.mkdir_p(frameworks_native_lisp)
-        info "Created staging frameworks native-lisp dir: #{frameworks_native_lisp}"
-      rescue => e
-        warn "Failed to create staging frameworks native-lisp dir: #{e.message}"
-      end
-
-      resources_dir = File.join(mac_app_path, "Emacs.app", "Contents", "Resources")
-      begin
-        FileUtils.mkdir_p(resources_dir)
-        info "Created staging Resources dir: #{resources_dir}"
-      rescue => e
-        warn "Failed to create staging Resources dir: #{e.message}"
-      end
-
-      # --- Pre-Copy Native-Lisp ---
-      native_lisp_src = File.join(source, "native-lisp")
-      if Dir.exist?(native_lisp_src)
-        staging_frameworks = File.join(mac_app_path, "Emacs.app", "Contents", "Frameworks")
-        begin
-          FileUtils.mkdir_p(staging_frameworks)
-          info "Copying native-lisp into staging Frameworks dir: #{staging_frameworks}"
-          if system("which", "rsync")
-            run_cmd("rsync", "-a", File.join(native_lisp_src, "/"), File.join(staging_frameworks, "/"))
-          else
-            FileUtils.cp_r(native_lisp_src, staging_frameworks)
-          end
-        rescue => e
-          warn "Failed to pre-copy native-lisp: #{e.message}"
-        end
-      end
-
       # Run make install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
@@ -240,9 +215,17 @@ class MacPortBuild < Build
         warn "make install exited with non-zero status"
       end
 
-      # --- CRITICAL FIX: Sanitize Nested Bundle ---
-      # Although passing parent dir usually prevents nesting, we check for safety.
-      # We inspect: Parent/Emacs.app/Contents/Emacs.app
+      # --- CLEANUP: Remove source code copied to Resources/etc ---
+      # Check path at install target (Output/Build/Emacs.app)
+      src_in_resources = File.join(mac_app_path, "Emacs.app", "Contents", "Resources", "etc", "src")
+      if Dir.exist?(src_in_resources)
+        info "Removing source directory from bundle Resources/etc/src..."
+        FileUtils.rm_rf(src_in_resources)
+      end
+
+      # --- SAFETY CHECK: Sanitize Nested Bundle ---
+      # Check for invalid nested structure at install target: Output/Build/Emacs.app/Contents/Emacs.app
+      # This acts as a safety check in case build logic creates nesting.
       target_app_bundle = File.join(mac_app_path, "Emacs.app")
 
       if File.directory?(target_app_bundle)
@@ -302,7 +285,7 @@ class MacPortBuild < Build
             end
           end
 
-          # 3. Delete the entire invalid nested bundle
+          # 3. Delete entire invalid nested bundle
           info "Removing nested bundle artifact..."
           FileUtils.rm_rf(nested_app)
 
@@ -313,18 +296,9 @@ class MacPortBuild < Build
       else
         fatal "Build failed: Expected app not found at #{target_app_bundle}"
       end
-
-      # --- CLEANUP: Remove source code ---
-      # Check: Parent/Emacs.app/Contents/Resources/etc/src
-      src_in_resources = File.join(mac_app_path, "Emacs.app", "Contents", "Resources", "etc", "src")
-      if Dir.exist?(src_in_resources)
-        info "Removing source directory from bundle Resources/etc/src..."
-        FileUtils.rm_rf(src_in_resources)
-      end
     end
 
-    # Return the full path to the .app bundle
-    # Path: Output/Build/Emacs.app
+    # Return app path
     alt_app = File.join(output_dir, build_name, "Emacs.app")
     if app_has_binary?(alt_app)
       info "Detected Emacs.app with binary at output directory: #{alt_app}"
@@ -388,8 +362,7 @@ class MacPortBuild < Build
     [target_dir, File.join(target_dir, File.basename(app))]
   end
 
-  # Sanitize bundle subdirectory names that contain two or more dots which
-  # cause Apple's codesign to reject the bundle.
+  # Sanitize bundle subdirectory names that contain two or more dots
   def sanitize_bundle_dirs(app)
     return unless File.exist?(app) && File.directory?(app)
 
@@ -419,7 +392,6 @@ class MacPortBuild < Build
         begin
           File.chmod(0o775, parent) unless File.writable?(parent)
         rescue => _e
-          # ignore
         end
 
         if File.exist?(new_name)
@@ -450,7 +422,6 @@ class MacPortBuild < Build
     end
   end
 
-  # Override signing to sanitize problematic directory names first.
   def self_sign_app(app)
     begin
       Dir[File.join(app, "**", "_CodeSignature")].each do |sigdir|
