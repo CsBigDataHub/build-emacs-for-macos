@@ -20,7 +20,7 @@ class MacPortBuild < Build
     if options[:dist_include].nil?
       options[:dist_include] = ["configure_output.txt", "COPYING"]
     else
-      # ensure default files are present without duplication
+      # ensure the default files are present without duplication
       defaults = ["configure_output.txt", "COPYING"]
       options[:dist_include] = (options[:dist_include] + defaults).uniq
     end
@@ -121,11 +121,13 @@ class MacPortBuild < Build
       ].flatten.join(":")
 
       # --- CLEANUP: Remove existing mac/Emacs.app to ensure fresh build ---
-      # If this directory exists from a previous failed or dirty build,
-      # make might get confused or merge artifacts.
-      if Dir.exist?(mac_target)
-        info "Cleaning up existing mac build directory: #{mac_target}"
-        FileUtils.rm_rf(mac_target)
+      # CRITICAL: Do NOT delete the 'mac' source directory itself!
+      # It contains essential templates (Info.plist.in) and Makefiles.
+      # Only remove the app bundle created by a previous build.
+      built_app_path = File.join(source, "mac", "Emacs.app")
+      if File.exist?(built_app_path)
+        info "Cleaning up existing built app to ensure fresh build: #{built_app_path}"
+        FileUtils.rm_rf(built_app_path)
       end
 
       # Build mac-port specific configure flags
@@ -217,8 +219,8 @@ class MacPortBuild < Build
 
       # --- CLEANUP: Remove source code copied to Resources/etc ---
       # make install sometimes copies the source directory into Resources/etc/src.
-      # This bloats the app and can cause "unsealed contents" issues if nested bundles exist.
-      src_in_resources = File.join(mac_target, "Emacs.app", "Contents", "Resources", "etc", "src")
+      # This bloats the app and can cause "unsealed contents" issues.
+      src_in_resources = File.join(source, "mac", "Emacs.app", "Contents", "Resources", "etc", "src")
       if Dir.exist?(src_in_resources)
         info "Removing source directory from bundle Resources/etc/src..."
         FileUtils.rm_rf(src_in_resources)
@@ -227,7 +229,7 @@ class MacPortBuild < Build
       # --- CRITICAL FIX: Sanitize Nested Bundle ---
       # Native-comp AOT sometimes causes make install to create a nested Emacs.app
       # structure: Emacs.app/Contents/Emacs.app/Contents/Frameworks/native-lisp/
-      # This causes codesign to fail with "unsealed contents present in the bundle root"
+      # This causes codesign to fail and breaks 'info' installation.
 
       source_app_path = File.join(source, "mac", "Emacs.app")
 
@@ -238,7 +240,7 @@ class MacPortBuild < Build
         if File.directory?(nested_app)
           warn "Detected invalid nested Emacs.app bundle - fixing structure..."
 
-          # 1. Rescue native-lisp directory
+          # 1. Rescue native-lisp directory (Critical for native-comp)
           nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
           nested_native_lisp = File.join(nested_frameworks, "native-lisp")
           target_frameworks = File.join(source_app_path, "Contents", "Frameworks")
@@ -248,37 +250,53 @@ class MacPortBuild < Build
             FileUtils.mkdir_p(target_frameworks)
             target_native_lisp = File.join(target_frameworks, "native-lisp")
 
-            # If target already has native-lisp, merge them (copy new files into it)
-            # to avoid losing potentially existing cached eln files if rebuilding
             if File.directory?(target_native_lisp)
               info "Merging native-lisp directories..."
-              # SYNTAX ERROR FIXED HERE:
               Dir.glob(File.join(nested_native_lisp, "*")).each do |file|
                 dest_file = File.join(target_native_lisp, File.basename(file))
                 FileUtils.cp_r(file, dest_file)
               end
             else
-              # Move entire directory
               info "Moving native-lisp from nested to main bundle..."
               FileUtils.mv(nested_native_lisp, target_frameworks)
             end
           end
 
-          # 2. Rescue orphaned resources
+          # 2. Rescue Resources (Info, etc, src)
+          # Handle cases where make install might have written ONLY to the nested app
           nested_resources = File.join(nested_app, "Contents", "Resources")
           if File.directory?(nested_resources)
             target_resources = File.join(source_app_path, "Contents", "Resources")
-            info "Checking for additional resources in nested bundle..."
+            info "Checking for resources in nested bundle (info, etc, src)..."
+
+            # Ensure target resource dir exists
+            FileUtils.mkdir_p(target_resources)
 
             Dir.glob(File.join(nested_resources, '*')).each do |item|
               basename = File.basename(item)
+              next if basename == "." || basename == ".."
+
               target_item = File.join(target_resources, basename)
 
-              # Only copy if it doesn't exist in main bundle to avoid overwriting valid files
+              # SPECIAL HANDLING FOR 'info':
+              # If nested 'info' is a file (corrupted), delete it. We need a directory.
+              if basename == "info"
+                if File.file?(item)
+                  warn "Found corrupted 'info' file in nested bundle. Deleting it."
+                  FileUtils.rm_f(item)
+                  next
+                end
+              end
+
+              # If item doesn't exist in main bundle, move it over.
+              # Use cp_r to handle files or directories safely.
               unless File.exist?(target_item)
-                warn "Found orphaned resource in nested bundle: #{basename}"
-                info "Moving #{basename} to main bundle..."
+                info "Moving #{basename} from nested to main bundle..."
+                # Use cp_r to avoid source removal errors if item is locked
                 FileUtils.cp_r(item, target_item)
+                # If cp_r succeeded, remove from nested to save space before nuking nested
+                FileUtils.rm_rf(item) if File.directory?(item)
+                FileUtils.rm_f(item) if File.file?(item)
               end
             end
           end
@@ -337,7 +355,7 @@ class MacPortBuild < Build
     end
   end
 
-  # Helper to check if an Emacs.app actually contains the compiled binary
+  # Helper to check if an Emacs.app actually contains a compiled binary
   # (not just a skeleton directory from source extraction)
   def app_has_binary?(app_path)
     return false unless File.exist?(app_path)
