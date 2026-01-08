@@ -8,8 +8,6 @@
 # overriding a few methods.
 
 # Load main NS-port build script by exact filename (no .rb extension).
-# Use `load` because `require_relative` appends ".rb" which does not match
-# executable script filename used in this repo.
 load File.join(__dir__, "build-emacs-for-macos")
 
 class MacPortBuild < Build
@@ -81,7 +79,8 @@ class MacPortBuild < Build
     p.uniq
   end
 
-  # Override compile_source to use Parent Directory Path, AOT flags, and Full Rescue.
+  # Override compile_source to use Relative Directory Path, AOT flags,
+  # PDMP Hoisting, and Nested Bundle Rescue.
   def compile_source(source)
     # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
@@ -120,14 +119,7 @@ class MacPortBuild < Build
         "/opt/homebrew/share/emacs/site-lisp",
       ].flatten.join(":")
 
-      # --- KEY FIX: Parent Directory Path ---
-      # mac_app_path is defined as output parent directory.
-      # We pass this to --enable-mac-app. Makefile appends Emacs.app to it.
-      mac_app_path = File.join(output_dir, build_name)
-      FileUtils.mkdir_p(mac_app_path)
-
       # --- FIX 1: Run autogen.sh ---
-      # Required for emacs-mac to generate configure scripts if they don't exist
       if File.exist?("autogen.sh")
         info "Running autogen.sh to generate configure scripts..."
         run_cmd("./autogen.sh")
@@ -137,8 +129,10 @@ class MacPortBuild < Build
         "--with-mac",
         "--with-modules",
         "--enable-locallisppath=#{local_lisp_path}",
-        # Pass PARENT directory path. Makefile adds "Emacs.app".
-        "--enable-mac-app=#{mac_app_path}",
+        # --- FIX 2: Relative Path ---
+        # We use a relative path here so the build system doesn't get confused
+        # about where to put the PDMP file. We move it later.
+        "--enable-mac-app=mac/Emacs.app",
         "--enable-mac-self-contained",
         "--with-mac-metal",
       ]
@@ -184,14 +178,10 @@ class MacPortBuild < Build
       # Adjust native-comp make flags
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
-
         if options[:native_full_aot]
-          # --- FIX 2: NATIVE_FULL_AOT=1 make flag ---
-          # This make flag is required in addition to configure flag
-          # to trigger full AOT dump phase correctly.
-          info "Building with AOT (configured via --with-native-compilation=aot)"
+          # Configure handles the NATIVE_FULL_AOT flag, but we must ensure
+          # we don't accidentally fast-boot.
           ENV.delete("NATIVE_FAST_BOOT")
-          make_flags << "NATIVE_FULL_AOT=1"
         else
           ENV.delete("NATIVE_FULL_AOT")
           ENV["NATIVE_FAST_BOOT"] = "1"
@@ -215,121 +205,106 @@ class MacPortBuild < Build
         warn "make install exited with non-zero status"
       end
 
-      # --- CLEANUP: Remove source code copied to Resources/etc ---
-      # Check path at install target (Output/Build/Emacs.app)
-      src_in_resources = File.join(mac_app_path, "Emacs.app", "Contents", "Resources", "etc", "src")
-      if Dir.exist?(src_in_resources)
-        info "Removing source directory from bundle Resources/etc/src..."
-        FileUtils.rm_rf(src_in_resources)
-      end
+      # Define the path where make install put the app (due to relative configure flag)
+      source_app_path = File.join(source, "mac", "Emacs.app")
 
-      # === NESTED BUNDLE SANITATION WITH FULL RESCUE ===
-      # This handles the "Russian Doll" problem where make install creates
-      # Output/Build/Emacs.app/Contents/Emacs.app. We must rescue contents from
-      # inner app to outer app before deletion.
-      target_app_bundle = File.join(mac_app_path, "Emacs.app")
-      nested_app = File.join(target_app_bundle, "Contents", "Emacs.app")
+      # --- FIX 3: Sanitize Nested Bundle (Russian Doll) ---
+      # Native AOT builds sometimes recursively install Emacs.app/Contents/Emacs.app
+      if File.directory?(source_app_path)
+        nested_app = File.join(source_app_path, "Contents", "Emacs.app")
 
-      if File.directory?(target_app_bundle) && File.directory?(nested_app)
-        warn "Detected invalid nested Emacs.app bundle - fixing structure..."
+        if File.directory?(nested_app)
+          warn "Detected invalid nested Emacs.app bundle - fixing structure..."
 
-        # 1. Rescue Frameworks/native-lisp
-        nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
-        nested_native_lisp = File.join(nested_frameworks, "native-lisp")
-        target_frameworks = File.join(target_app_bundle, "Contents", "Frameworks")
+          # Rescue native-lisp
+          nested_frameworks = File.join(nested_app, "Contents", "Frameworks")
+          nested_native_lisp = File.join(nested_frameworks, "native-lisp")
+          target_frameworks = File.join(source_app_path, "Contents", "Frameworks")
 
-        if File.directory?(nested_native_lisp)
-          info "Rescuing native-lisp from nested bundle..."
-          FileUtils.mkdir_p(target_frameworks)
-          target_native_lisp = File.join(target_frameworks, "native-lisp")
-          if File.directory?(target_native_lisp)
-            info "Merging native-lisp directories..."
-            # Copy contents to merge
-            FileUtils.cp_r(Dir.glob("#{nested_native_lisp}/*"), target_native_lisp)
-          else
-            FileUtils.mv(nested_native_lisp, target_frameworks)
-          end
-        end
+          if File.directory?(nested_native_lisp)
+            info "Rescuing native-lisp from nested bundle..."
+            FileUtils.mkdir_p(target_frameworks)
+            target_native_lisp = File.join(target_frameworks, "native-lisp")
 
-        # 2. Rescue Resources
-        nested_resources = File.join(nested_app, "Contents", "Resources")
-        if File.directory?(nested_resources)
-          target_resources = File.join(target_app_bundle, "Contents", "Resources")
-          FileUtils.mkdir_p(target_resources)
-          info "Rescuing Resources from nested bundle..."
-          Dir.glob(File.join(nested_resources, '*')).each do |item|
-            basename = File.basename(item)
-            next if basename == "." || basename == ".."
-            target_item = File.join(target_resources, basename)
-            # Handle corrupted 'info' file
-            if basename == "info" && File.file?(item)
-              warn "Deleting corrupted 'info' file in nested bundle."
-              FileUtils.rm_f(item)
-              next
-            end
-            FileUtils.cp_r(item, target_resources) unless File.exist?(target_item)
-          end
-        end
-
-        # 3. Rescue MacOS directory (Critical for pdmp)
-        # Contains binary and libexec/Emacs.pdmp
-        nested_macos = File.join(nested_app, "Contents", "MacOS")
-        target_macos = File.join(target_app_bundle, "Contents", "MacOS")
-
-        if File.directory?(nested_macos)
-          info "Rescuing MacOS directory (binary + pdmp) from nested bundle..."
-          FileUtils.mkdir_p(target_macos)
-
-          Dir.glob(File.join(nested_macos, "*")).each do |item|
-            basename = File.basename(item)
-            target_item = File.join(target_macos, basename)
-
-            # Polished: Move files, Copy directories (safer merge)
-            if File.directory?(item) && File.directory?(target_item)
-              info "Merging #{basename} directory..."
-              FileUtils.cp_r("#{item}/.", target_item)
+            if File.directory?(target_native_lisp)
+              # Merge if exists
+              run_cmd("rsync", "-a", "#{nested_native_lisp}/", "#{target_native_lisp}/")
             else
-              FileUtils.mv(item, target_macos) unless File.exist?(target_item)
+              # Move if not
+              FileUtils.mv(nested_native_lisp, target_frameworks)
             end
           end
+
+          # Rescue Resources
+          nested_resources = File.join(nested_app, "Contents", "Resources")
+          if File.directory?(nested_resources)
+            target_resources = File.join(source_app_path, "Contents", "Resources")
+            info "Rescuing Resources from nested bundle..."
+            Dir.glob(File.join(nested_resources, '*')).each do |item|
+              basename = File.basename(item)
+              target_item = File.join(target_resources, basename)
+              # Don't overwrite existing items, but rescue missing ones
+              FileUtils.cp_r(item, target_resources) unless File.exist?(target_item)
+            end
+          end
+
+          # Delete nested shell
+          info "Removing nested bundle artifact..."
+          FileUtils.rm_rf(nested_app)
+        end
+      end
+
+      # --- FIX 4: Hoist PDMP file (Fixes Dump mode: nil) ---
+      # Native AOT builds put the pdmp in Contents/MacOS/libexec/<arch>/Emacs.pdmp
+      # We need it in Contents/MacOS/Emacs.pdmp so the binary can find it
+      if File.directory?(source_app_path)
+        macos_dir = File.join(source_app_path, "Contents", "MacOS")
+
+        # Find any pdmp files in the entire MacOS directory structure
+        # (Usually in MacOS/libexec/aarch64.../Emacs.pdmp)
+        pdmp_files = Dir[File.join(macos_dir, "**", "*.pdmp")]
+
+        pdmp_files.each do |pdmp_source|
+          pdmp_name = File.basename(pdmp_source)
+          pdmp_dest = File.join(macos_dir, pdmp_name)
+
+          # If the file is not already in the root MacOS dir, copy it up
+          if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
+            info "Hoisting PDMP file: #{pdmp_source} -> #{pdmp_dest}"
+            FileUtils.cp(pdmp_source, pdmp_dest)
+          end
+        end
+      end
+
+      # --- FIX 5: Move App to Output Directory ---
+      final_app_dir = File.join(output_dir, build_name)
+      final_app_path = File.join(final_app_dir, "Emacs.app")
+
+      if File.directory?(source_app_path)
+        info "Moving self-contained app from source to output directory..."
+        FileUtils.mkdir_p(final_app_dir)
+
+        # Prevent moving new app INSIDE old app if one exists
+        if File.exist?(final_app_path)
+          info "Removing existing app at destination..."
+          FileUtils.rm_rf(final_app_path)
         end
 
-        # 4. Verify pdmp was rescued
-        pdmp_pattern = File.join(target_macos, "libexec", "*", "Emacs.pdmp")
-        rescued_pdmps = Dir.glob(pdmp_pattern)
-        if rescued_pdmps.any?
-          info "Verified pdmp rescued: #{rescued_pdmps.first}"
-        else
-          warn "WARNING: No Emacs.pdmp found after MacOS rescue - dump mode may fall back to source"
-        end
-
-        # 5. Remove nested artifact
-        info "Removing nested bundle artifact..."
-        FileUtils.rm_rf(nested_app)
-        info "Bundle structure sanitized successfully"
+        FileUtils.mv(source_app_path, final_app_dir)
+        info "App successfully moved to #{final_app_path}"
       else
-        info "No nested bundle detected - structure is correct"
-      end
-
-      # === FINAL VERIFICATION ===
-      # Ensure the app bundle is valid after sanitization
-      unless File.directory?(target_app_bundle)
-        fatal "Build failed: Expected app not found at #{target_app_bundle}"
-      end
-
-      unless app_has_binary?(target_app_bundle)
-        fatal "Build failed: App binary not found after sanitization at #{target_app_bundle}"
+        fatal "Build failed: Expected app not found at #{source_app_path}"
       end
     end
 
-    # Return app path
+    # Return result
     alt_app = File.join(output_dir, build_name, "Emacs.app")
     if app_has_binary?(alt_app)
       info "Detected Emacs.app with binary at output directory: #{alt_app}"
       return alt_app
-    else
-      fatal "Build failed. Emacs.app with binary not found at #{alt_app}"
     end
+
+    fatal "Build failed. Emacs.app with binary not found after build."
   end
 
   # Helper to check if an Emacs.app actually contains a compiled binary
