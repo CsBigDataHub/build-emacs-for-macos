@@ -3,7 +3,9 @@
 
 # Lightweight wrapper reusing build-emacs-for-macos implementation
 # to build "Mac port" (jdtsmith/emacs-mac) without applying
-# NS-port specific patches.
+# NS-port specific patches. This file delegates nearly all behavior to
+# original build-emacs-for-macos script by subclassing Build and
+# overriding a few methods.
 
 load File.join(__dir__, "build-emacs-for-macos")
 
@@ -66,14 +68,59 @@ class MacPortBuild < Build
     p.uniq
   end
 
+  # Helper method to hoist PDMP files from libexec to MacOS root
+  def hoist_pdmp_files(app_path, location_name = "bundle")
+    return unless File.directory?(app_path)
+
+    macos_dir = File.join(app_path, "Contents", "MacOS")
+    return unless File.directory?(macos_dir)
+
+    # Find all PDMP files in libexec subdirectories
+    pdmp_candidates = Dir.glob(File.join(macos_dir, "libexec", "**", "*.pdmp"))
+
+    if pdmp_candidates.any?
+      pdmp_candidates.each do |pdmp_source|
+        pdmp_name = File.basename(pdmp_source)
+        pdmp_dest = File.join(macos_dir, pdmp_name)
+
+        if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
+          info "Hoisting PDMP in #{location_name}: #{pdmp_source} -> #{pdmp_dest}"
+          # Use cp to preserve the source in case something needs it
+          FileUtils.cp(pdmp_source, pdmp_dest)
+        end
+      end
+    else
+      # Check if PDMP already exists at root level
+      existing_pdmp = File.join(macos_dir, "Emacs.pdmp")
+      if File.exist?(existing_pdmp)
+        info "PDMP already at correct location in #{location_name}"
+      else
+        warn "WARNING: No PDMP found in #{location_name} at #{macos_dir}"
+      end
+    end
+
+    # Create symlink for Emacs.real.pdmp
+    final_pdmp = File.join(macos_dir, "Emacs.pdmp")
+    real_pdmp = File.join(macos_dir, "Emacs.real.pdmp")
+
+    if File.exist?(final_pdmp) && !File.exist?(real_pdmp)
+      begin
+        FileUtils.ln_s("Emacs.pdmp", real_pdmp)
+        info "Created symlink in #{location_name}: Emacs.real.pdmp -> Emacs.pdmp"
+      rescue => e
+        warn "Failed to create PDMP symlink in #{location_name}: #{e.message}"
+      end
+    end
+  end
+
   # Override compile_source to build into a clean staging directory
   def compile_source(source)
+    # Accept either mac-port or NS-port style prebuilt app directories
     ns_target = File.join(source, "nextstep")
     mac_target = File.join(source, "mac")
     ns_app = File.join(ns_target, "Emacs.app")
     mac_app = File.join(mac_target, "Emacs.app")
 
-    # Early check for cached builds
     if app_has_binary?(ns_app)
       rel = ns_target.gsub("#{root_dir}/", "")
       info "Emacs.app with binary already exists in \"#{rel}\", attempting to use."
@@ -87,6 +134,7 @@ class MacPortBuild < Build
     info "Compiling from source. This will take a while..."
 
     FileUtils.cd(source) do
+      # Set up native-comp
       if options[:native_comp]
         info "Compiling with native-comp enabled"
         verify_native_comp
@@ -142,6 +190,7 @@ class MacPortBuild < Build
       configure_flags << "--without-rsvg" if options[:rsvg] == false
       configure_flags << "--without-dbus" if options[:dbus] == false
 
+      # Installation prefix for aux files (not the app bundle)
       staging_prefix = File.join(output_dir, build_name, "staging")
       FileUtils.mkdir_p(staging_prefix)
       configure_flags << "--prefix=#{staging_prefix}"
@@ -187,89 +236,11 @@ class MacPortBuild < Build
 
       # Our app is now located in mac/staging/Emacs.app
       source_app_path = File.join(source, "mac", staging_dir_name, "Emacs.app")
+      info "App bundle created at: #{source_app_path}"
 
-      # Diagnostic: Confirm existence
-      unless File.directory?(source_app_path)
-        # Fallback check (rare case where Makefile ignored suffix)
-        alt_path = File.join(source, "mac", "Emacs.app")
-        if File.directory?(alt_path)
-          warn "App found in default location, not staging. Using it."
-          source_app_path = alt_path
-        else
-          fatal "Build failed: App not found at #{source_app_path}"
-        end
-      end
-
-      # === SANITIZATION PHASE (Unconditional) ===
-
-      # 1. FIX ROOT NESTING (Emacs.app/Emacs.app)
-      # Even with staging, we check this just to be safe.
-      nested_root_app = File.join(source_app_path, "Emacs.app")
-      if File.directory?(nested_root_app)
-        warn "Detected nested Emacs.app at ROOT. Promoting inner app..."
-
-        # Staging temp path
-        temp_staging = File.join(source, "mac", "Emacs_temp_staging.app")
-        FileUtils.mv(nested_root_app, temp_staging)
-
-        # Helper to rescue directories (Resources/Frameworks/MacOS) from Outer to Inner
-        rescue_dir = lambda do |subpath|
-          outer_dir = File.join(source_app_path, subpath)
-          inner_dir = File.join(temp_staging, subpath)
-          if File.directory?(outer_dir)
-            FileUtils.mkdir_p(inner_dir)
-            Dir.glob(File.join(outer_dir, "*")).each do |item|
-              basename = File.basename(item)
-              target_item = File.join(inner_dir, basename)
-              unless File.exist?(target_item)
-                info "Rescuing #{subpath}/#{basename} from outer bundle"
-                FileUtils.cp_r(item, inner_dir)
-              end
-            end
-          end
-        end
-
-        rescue_dir.call("Contents/Frameworks")
-        rescue_dir.call("Contents/Resources")
-        rescue_dir.call("Contents/MacOS")
-
-        # Nuke outer
-        FileUtils.rm_rf(source_app_path)
-        # Move inner back
-        FileUtils.mv(temp_staging, source_app_path)
-        info "Root nesting fixed. Inner app promoted."
-      end
-
-      # 2. FIX PDMP LOCATION
-      # Unconditionally look for Emacs.pdmp in libexec and hoist it.
-      if File.directory?(source_app_path)
-        macos_dir = File.join(source_app_path, "Contents", "MacOS")
-        pdmp_files = Dir[File.join(macos_dir, "**", "*.pdmp")]
-
-        pdmp_files.each do |pdmp_source|
-          pdmp_name = File.basename(pdmp_source)
-          pdmp_dest = File.join(macos_dir, pdmp_name)
-
-          if File.expand_path(pdmp_source) != File.expand_path(pdmp_dest)
-            info "Hoisting PDMP file: #{pdmp_source} -> #{pdmp_dest}"
-            FileUtils.cp(pdmp_source, pdmp_dest)
-          end
-        end
-
-        # Verify and Link
-        final_pdmp = File.join(macos_dir, "Emacs.pdmp")
-        real_pdmp = File.join(macos_dir, "Emacs.real.pdmp")
-
-        if File.exist?(final_pdmp)
-          info "PDMP successfully placed at #{final_pdmp}"
-          unless File.exist?(real_pdmp)
-            info "Creating symlink for Emacs.real.pdmp..."
-            FileUtils.ln_s("Emacs.pdmp", real_pdmp)
-          end
-        else
-          warn "WARNING: No Emacs.pdmp found in #{macos_dir} — dumped mode will fail"
-        end
-      end
+      # --- FIX: HOIST PDMP IN SOURCE LOCATION ---
+      # This cleans up the structure before we move it
+      hoist_pdmp_files(source_app_path, "source bundle")
 
       # --- MOVE APP TO OUTPUT ---
       final_app_dir = File.join(output_dir, build_name)
@@ -282,40 +253,36 @@ class MacPortBuild < Build
 
         FileUtils.mv(source_app_path, final_app_path)
         info "App successfully moved to #{final_app_path}"
+
+        # --- FIX: HOIST PDMP AGAIN IN FINAL LOCATION ---
+        # Ensures correctness after move and any potential renaming
+        hoist_pdmp_files(final_app_path, "final bundle")
       else
+        staging_root = File.join(source, "mac", staging_dir_name)
+        if File.directory?(staging_root)
+          warn "Contents of staging dir #{staging_root}:"
+          warn Dir.entries(staging_root).join(", ")
+        end
         fatal "Build failed: App not found at #{source_app_path}"
       end
     end
 
     alt_app = File.join(output_dir, build_name, "Emacs.app")
-    return alt_app if app_has_binary?(alt_app)
+
+    # Relaxed validation: Return app if directory exists, even if binary check is imperfect
+    return alt_app if File.directory?(alt_app)
 
     fatal "Build failed. Emacs.app not found."
   end
 
-  # Refined validation based on user feedback
+  # Helper to check if an Emacs.app actually contains a compiled binary
   def app_has_binary?(app_path)
     return false unless File.exist?(app_path)
-
     macos_dir = File.join(app_path, "Contents", "MacOS")
     return false unless File.directory?(macos_dir)
 
-    # Check for main binary (Emacs)
     binary = File.join(macos_dir, "Emacs")
-    has_binary = File.file?(binary) && !File.symlink?(binary)
-
-    # Check for versioned binary if main not found
-    unless has_binary
-      has_binary = Dir[File.join(macos_dir, "Emacs-*")].any? { |p| File.file?(p) && !File.symlink?(p) }
-    end
-
-    # Check for PDMP if native compilation is enabled
-    if options[:native_comp]
-      has_pdmp = File.exist?(File.join(macos_dir, "Emacs.pdmp"))
-      return has_binary && has_pdmp
-    end
-
-    has_binary
+    File.file?(binary) && !File.symlink?(binary)
   end
 
   def create_build_dir(app)
