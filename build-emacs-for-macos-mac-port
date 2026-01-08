@@ -122,7 +122,7 @@ class MacPortBuild < Build
         "/opt/homebrew/share/emacs/site-lisp",
       ].flatten.join(":")
 
-      # Build mac-port specific configure flags (ignore NS-port flags)
+      # Build mac-port specific configure flags
       mac_app_path = File.join(output_dir, build_name)
       configure_flags = [
         "--with-mac",
@@ -136,12 +136,20 @@ class MacPortBuild < Build
       configure_flags << "--with-xwidgets" if options[:xwidgets] && supports_xwidgets?
       configure_flags << "--with-tree-sitter" if options[:tree_sitter] && supports_tree_sitter?
 
-      # Native-comp: prefer explicit aot when requested, else use detected flag
+      # CRITICAL FIX: Native-comp configuration
+      # Use configure-time flag, not make-time environment variable
       if options[:native_comp]
         if options[:native_full_aot]
+          # This tells configure to generate Makefile with AOT rules
           configure_flags << "--with-native-compilation=aot"
+          info "Configuring with --with-native-compilation=aot for full AOT"
         else
-          configure_flags << native_comp_configure_flag if native_comp_configure_flag
+          # Standard native-comp without AOT
+          if native_comp_configure_flag
+            configure_flags << native_comp_configure_flag
+          else
+            configure_flags << "--with-native-compilation=yes"
+          end
         end
       end
 
@@ -166,12 +174,16 @@ class MacPortBuild < Build
       make_flags = []
       make_flags += ["-j", options[:parallel].to_s] if options[:parallel]
 
-      # Adjust native-comp make flags
+      # CRITICAL FIX: Adjust native-comp make flags
+      # Do NOT set NATIVE_FULL_AOT as environment or make variable
+      # when using --with-native-compilation=aot in configure
       if options[:native_comp]
         make_flags << "BYTE_COMPILE_EXTRA_FLAGS=--eval '(setq comp-speed 2)'"
+
         if options[:native_full_aot]
-          info "Using native compile full AOT"
-          make_flags << "NATIVE_FULL_AOT=1"
+          info "Building with AOT (configured via --with-native-compilation=aot)"
+          # DO NOT set ENV["NATIVE_FULL_AOT"] = "1" - conflicts with configure
+          # DO NOT add NATIVE_FULL_AOT=1 to make_flags - configure handles it
           ENV.delete("NATIVE_FAST_BOOT")
         else
           ENV.delete("NATIVE_FULL_AOT")
@@ -212,23 +224,111 @@ class MacPortBuild < Build
         info "Added coreutils gnubin to PATH: #{gnubin}"
       end
 
-      # Run make install via shell to mimic interactive behavior and capture log
+      # Run make install
       install_log = File.join(output_dir, build_name, "install_output.txt")
       sh_cmd = "make install 2>&1 | tee \"#{install_log}\""
       unless system("sh", "-lc", sh_cmd)
         warn "make install exited with non-zero status"
       end
 
-      # If make install placed Emacs.app directly into the output build dir
-      # (common for mac-port --enable-mac-app install targets), prefer that
-      # path as the produced app.
+      # CRITICAL FIX: Verify and copy AOT pdmp file
+      if options[:native_comp] && options[:native_full_aot]
+        info "Verifying PDMP installation for AOT build..."
+
+        # 1. Locate the PDMP in the Source (Build) Directory
+        build_pdmp_candidates = [
+          File.join(source, "src", "emacs.pdmp"),
+          File.join(source, "src", "Emacs.pdmp"),
+        ]
+        build_pdmp = build_pdmp_candidates.find { |f| File.exist?(f) }
+        build_pdmp ||= Dir[File.join(source, "src", "*.pdmp")].first
+
+        if build_pdmp.nil? || !File.exist?(build_pdmp)
+          fatal "AOT build failed: Could not find emacs.pdmp in #{File.join(source, 'src')}. " \
+                "The native-full-aot compilation did not complete successfully."
+        end
+
+        pdmp_size_mb = File.size(build_pdmp) / 1024.0 / 1024.0
+        info "Found AOT pdmp file: #{File.basename(build_pdmp)} (#{pdmp_size_mb.round(2)} MB)"
+
+        if pdmp_size_mb < 10
+          warn "WARNING: pdmp file seems small for NATIVE_FULL_AOT (#{pdmp_size_mb.round(2)} MB). " \
+               "Expected > 10 MB. Build may be incomplete."
+        end
+
+        # 2. Locate the App Bundle
+        app_search_paths = [
+          File.join(output_dir, build_name, "Emacs.app"),
+          File.join(source, "mac", "Emacs.app"),
+          File.join(source, "nextstep", "Emacs.app"),
+        ]
+
+        app_dir = app_search_paths.find { |p| File.directory?(p) }
+
+        if app_dir.nil?
+          fatal "Could not locate Emacs.app bundle after make install"
+        end
+
+        info "Located app bundle: #{app_dir}"
+
+        # 3. Find the Emacs binary location
+        possible_binary_paths = [
+          File.join(app_dir, "Contents", "MacOS", "Emacs"),
+          File.join(app_dir, "Contents", "MacOS", "libexec", "Emacs"),
+        ]
+
+        emacs_binary = possible_binary_paths.find { |p| File.exist?(p) && File.executable?(p) }
+
+        if emacs_binary.nil?
+          fatal "Could not locate Emacs binary in app bundle"
+        end
+
+        dest_dir = File.dirname(emacs_binary)
+        dest_pdmp = File.join(dest_dir, File.basename(build_pdmp))
+
+        info "Expected pdmp location: #{dest_pdmp}"
+
+        # 4. Check if pdmp needs to be copied
+        pdmp_needs_copy = false
+
+        if !File.exist?(dest_pdmp)
+          warn "PDMP file missing in bundle"
+          pdmp_needs_copy = true
+        else
+          dest_size_mb = File.size(dest_pdmp) / 1024.0 / 1024.0
+          info "Found pdmp in bundle: #{dest_size_mb.round(2)} MB"
+
+          # Check if sizes match (allow 1% difference)
+          if (dest_size_mb - pdmp_size_mb).abs > (pdmp_size_mb * 0.01)
+            warn "Bundle pdmp size (#{dest_size_mb.round(2)} MB) differs from build (#{pdmp_size_mb.round(2)} MB)"
+            pdmp_needs_copy = true
+          end
+        end
+
+        # 5. Copy if needed
+        if pdmp_needs_copy
+          info "Copying pdmp from source to bundle..."
+          begin
+            FileUtils.cp(build_pdmp, dest_pdmp)
+            FileUtils.chmod(0o644, dest_pdmp)
+            copied_size_mb = File.size(dest_pdmp) / 1024.0 / 1024.0
+            info "Successfully copied pdmp: #{copied_size_mb.round(2)} MB"
+          rescue => e
+            fatal "Failed to copy pdmp file: #{e.message}"
+          end
+        else
+          info "PDMP file correctly installed in bundle"
+        end
+      end
+
+      # Check for app at install target
       alt_app = File.join(output_dir, build_name, "Emacs.app")
       if app_has_binary?(alt_app)
-        info "Detected Emacs.app with binary at install target: #{alt_app}, using that as build output"
+        info "Detected Emacs.app with binary at install target: #{alt_app}"
         return alt_app
       end
 
-      # If install failed, print tail of install log for debugging
+      # If install failed, print log
       unless app_has_binary?(ns_app) || app_has_binary?(mac_app) || app_has_binary?(alt_app)
         if File.exist?(install_log)
           warn "--- #{install_log} (last 200 lines) ---"
@@ -237,8 +337,7 @@ class MacPortBuild < Build
       end
     end
 
-    # After building, prefer a produced app under source (ns or mac). If none
-    # exists, fail.
+    # Return the produced app
     if app_has_binary?(ns_app)
       ns_app
     elsif app_has_binary?(mac_app)
